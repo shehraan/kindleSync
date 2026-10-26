@@ -1,0 +1,20 @@
+{
+  "verified_at": "2026-10-19T04:21:30.128795+00:00",
+  "environment": "AOSP Android emulator (software CPU emulation)",
+  "android_release": "11",
+  "api_level": "30",
+  "apk_sha256": "1c7ef2b18172069f51a244cbb9bc99249ca71b0938b2c8dcf9dfbb479a217785",
+  "test_apk_sha256": "4d3bef9fb54668a7d7674457c4a0975d74d5a71ad16be1970119635a38756182",
+  "fixture": "Generated MP3 and AAC/M4B tones; synthetic handoff; production API, SyncClient, JobService and MediaPlayer",
+  "limitations": [
+    "Not the user phone or Kobo",
+    "Native job explicitly forced; no claim of wall-clock execution time",
+    "Does not measure audiobook speech alignment accuracy"
+  ],
+  "checks": {
+    "online": "INSTRUMENTATION_RESULT: stream=PASS online: revision=runtime-original, start_ms=10109, target_ms=10000, track=1, saved_ms=2178\n\nINSTRUMENTATION_CODE: -1\n",
+    "offline": "INSTRUMENTATION_RESULT: stream=PASS offline: revision=runtime-original, start_ms=2263, target_ms=2178, track=1, saved_ms=27340\n\nINSTRUMENTATION_CODE: -1\n",
+    "new_handoff": "INSTRUMENTATION_RESULT: stream=PASS new: revision=runtime-next, start_ms=20236, target_ms=20000, track=0, saved_ms=26629\n\nINSTRUMENTATION_CODE: -1\n",
+    "background_job": "INSTRUMENTATION_RESULT: stream=PASS background: revision=runtime-background, tracks=1, native JobScheduler download verified\n\nINSTRUMENTATION_CODE: -1\n"
+  }
+}

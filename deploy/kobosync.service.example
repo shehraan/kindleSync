@@ -1,0 +1,18 @@
+# Replace /absolute/path/koboSync with the checkout location before installing.
+# This is a template, not an enabled service.
+[Unit]
+Description=KoboSync morning audiobook handoff
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/koboSync
+ExecStart=/absolute/path/koboSync/.venv/bin/python -m kobosync --data /absolute/path/koboSync/data serve --host 0.0.0.0
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

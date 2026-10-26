@@ -1,0 +1,5195 @@
+local Dispatcher = require("dispatcher")
+local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
+local Menu = require("ui/widget/menu")
+local ButtonDialog = require("ui/widget/buttondialog")
+local Button = require("ui/widget/button")
+local Blitbuffer = require("ffi/blitbuffer")
+local Geom = require("ui/geometry")
+local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local Device = require("device")
+local Screen = Device.screen
+local HorizontalSpan = require("ui/widget/horizontalspan")
+local CheckButton = require("ui/widget/checkbutton")
+local MultiInputDialog = require("ui/widget/multiinputdialog")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local util = require("util")
+local FileManager = require("apps/filemanager/filemanager")
+local FileManagerUtil = require("apps/filemanager/filemanagerutil")
+local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
+local WebBrowserHttp = require("webbrowser_http")
+local socket = require("socket")
+local socketutil = require("socketutil")
+local ltn12 = require("ltn12")
+local _ = require("gettext")
+local NetworkMgr = require("ui/network/manager")
+local DocumentRegistry = require("document/documentregistry")
+local DataStorage = require("datastorage")
+local LuaSettings = require("luasettings")
+
+local MarkdownViewer = require("webbrowser_markdown_viewer")
+local Utils = require("webbrowser_utils")
+local MuPDFRenderer = require("webbrowser_renderer")
+local config_loaded, config_result = pcall(require, "webbrowser_configuration")
+local CONFIG = config_loaded and config_result or {}
+local CONFIG_MISSING = not config_loaded
+local BookmarksStore = require("webbrowser_bookmarks")
+local SearchHistoryStore = require("webbrowser_history")
+local WebsiteHistoryStore = require("webbrowser_website_history")
+local Random = require("random")
+
+local function removeWidgetFromGroup(group, target)
+    if not group or not target then
+        return
+    end
+    for index, widget in ipairs(group) do
+        if widget == target then
+            table.remove(group, index)
+            break
+        end
+    end
+end
+
+local SearchEngines = {
+    bing_rss = require("webbrowser_bing"),
+    duckduckgo = require("webbrowser_duckduckgo"),
+    brave_api = require("webbrowser_brave_api"),
+    google_api = require("webbrowser_google_api"),
+    tavily_api = require("webbrowser_tavily_api"),
+    exa_api = require("webbrowser_exa_api"),
+    kiwix = require("webbrowser_kiwix"),
+}
+
+local GOOGLE_DEFAULT_BATCH_SIZE = 10
+local GOOGLE_API_MAX_TOTAL = 100
+local BRAVE_DEFAULT_BATCH_SIZE = 10
+local BRAVE_API_MAX_TOTAL = 200
+local TAVILY_DEFAULT_BATCH_SIZE = 10
+local TAVILY_API_MAX_TOTAL = 20
+local EXA_DEFAULT_BATCH_SIZE = 10
+local EXA_API_MAX_TOTAL = 100
+local KIWIX_DEFAULT_BATCH_SIZE = 25
+local KIWIX_MAX_PAGE_LENGTH = 140 -- kiwix-serve refuses anything larger
+
+local DEFAULT_SEARCH_ENGINE = "duckduckgo"
+local DEFAULT_HISTORY_LIMIT = 10
+local DEFAULT_WEBSITE_HISTORY_LIMIT = 50
+local DEFAULT_TIMEOUT = 15
+local DEFAULT_MAXTIME = 30
+local HIGHLIGHT_QUERY_MAX_LENGTH = 300
+
+local WebBrowser = WidgetContainer:extend{
+    name = "webbrowser",
+    is_doc_only = false,
+}
+
+local function removePath(path)
+    local attributes = lfs.attributes(path)
+    if not attributes then
+        return true
+    end
+
+    if attributes.mode == "directory" then
+        for entry in lfs.dir(path) do
+            if entry ~= "." and entry ~= ".." then
+                local ok, err = removePath(path .. "/" .. entry)
+                if not ok then
+                    return false, err
+                end
+            end
+        end
+        local ok, err = lfs.rmdir(path)
+        if not ok then
+            return false, err
+        end
+        return true
+    end
+
+    local ok, err = os.remove(path)
+    if not ok then
+        return false, err
+    end
+    return true
+end
+
+local function trim_text(value)
+    return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function sanitize_plain_text(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local cleaned = util.htmlToPlainTextIfHtml(value)
+    cleaned = trim_text(cleaned)
+    if cleaned == "" then
+        return nil
+    end
+    return cleaned
+end
+
+local function normalize_history_url(url)
+    if type(url) ~= "string" then
+        return nil
+    end
+    local trimmed = trim_text(url)
+    if trimmed == "" then
+        return nil
+    end
+    if Utils and Utils.decode_result_url then
+        local decoded = Utils.decode_result_url(trimmed)
+        if type(decoded) == "string" then
+            decoded = trim_text(decoded)
+            if decoded ~= "" then
+                trimmed = decoded
+            end
+        end
+    end
+    if not trimmed:match("^https?://") then
+        return nil
+    end
+    return trimmed
+end
+
+local function is_html_file(path)
+    if type(path) ~= "string" then
+        return false
+    end
+    local lower = path:lower()
+    local stripped = lower:match("([^?#]+)") or lower
+    if stripped:sub(-5) == ".html" then
+        return true
+    end
+    if stripped:sub(-4) == ".htm" then
+        return true
+    end
+    if stripped:sub(-6) == ".xhtml" then
+        return true
+    end
+    return false
+end
+
+function WebBrowser:removeSdrDirectoryForPath(file_path)
+    if not is_html_file(file_path) then
+        return
+    end
+    local directory, filename = file_path:match("^(.*)/([^/]+)$")
+    if not filename then
+        filename = file_path
+        directory = ""
+    end
+    local name_without_ext = filename
+    local base_name, _ = util.splitFileNameSuffix(filename)
+    if base_name and base_name ~= "" then
+        name_without_ext = base_name
+    end
+    local sdr_name = name_without_ext .. ".sdr"
+    local sdr_path
+    if directory ~= "" then
+        sdr_path = directory .. "/" .. sdr_name
+    else
+        sdr_path = sdr_name
+    end
+    local ok, removed, err = pcall(removePath, sdr_path)
+    if not ok then
+        logger.warn("webbrowser", "exception while removing .sdr directory", sdr_path, removed)
+        return
+    end
+    if not removed and err then
+        logger.warn("webbrowser", "failed to remove .sdr directory", sdr_path, err)
+    end
+end
+
+function WebBrowser:getSearchHistoryStore()
+    if not self.search_history_store then
+        self.search_history_store = SearchHistoryStore:new {
+            max_entries = self:getSearchHistoryLimit(),
+        }
+    end
+    return self.search_history_store
+end
+
+function WebBrowser:hasSearchHistoryEntries()
+    local store = self:getSearchHistoryStore()
+    if not store then
+        return false
+    end
+    return store:hasEntries()
+end
+
+function WebBrowser:getSearchHistoryLimit()
+    local limit = CONFIG.search_history_limit
+    if type(limit) == "string" then
+        local numericLimit = tonumber(limit)
+        if numericLimit ~= nil then
+            limit = numericLimit
+        end
+    end
+    if type(limit) == "number" then
+        local floored = math.floor(limit)
+        if floored > 0 then
+            return floored
+        end
+    end
+    return DEFAULT_HISTORY_LIMIT
+end
+
+function WebBrowser:getWebsiteHistoryLimit()
+    local limit = CONFIG.website_history_limit
+    if type(limit) == "string" then
+        local numericLimit = tonumber(limit)
+        if numericLimit ~= nil then
+            limit = numericLimit
+        end
+    end
+    if type(limit) == "number" then
+        local floored = math.floor(limit)
+        if floored > 0 then
+            return floored
+        end
+        return 0
+    end
+    if limit == nil then
+        return DEFAULT_WEBSITE_HISTORY_LIMIT
+    end
+    return DEFAULT_WEBSITE_HISTORY_LIMIT
+end
+
+function WebBrowser:isWebsiteHistoryEnabled()
+    return self:getWebsiteHistoryLimit() > 0
+end
+
+function WebBrowser:shouldAllowDuplicateWebsiteHistory()
+    local value = CONFIG.duplicate_entry_on_website_history
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local normalized = value:lower()
+        if normalized == "false" or normalized == "0" or normalized == "no" then
+            return false
+        end
+        if normalized == "true" or normalized == "1" or normalized == "yes" then
+            return true
+        end
+    end
+    return true
+end
+
+function WebBrowser:isHighlightSearchEnabled()
+    local value = CONFIG.search_highlighted_text
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local normalized = value:lower()
+        if normalized == "true" or normalized == "1" or normalized == "yes" then
+            return true
+        end
+    end
+    return false
+end
+
+function WebBrowser:getWebsiteHistoryStore()
+    if not self:isWebsiteHistoryEnabled() then
+        self.website_history_store = nil
+        return nil
+    end
+    if not self.website_history_store then
+        self.website_history_store = WebsiteHistoryStore:new {
+            max_entries = self:getWebsiteHistoryLimit(),
+            allow_duplicates = self:shouldAllowDuplicateWebsiteHistory(),
+        }
+    end
+    return self.website_history_store
+end
+
+function WebBrowser:hasWebsiteHistoryEntries()
+    local store = self:getWebsiteHistoryStore()
+    if not store then
+        return false
+    end
+    local entries = store:getAll()
+    return entries and #entries > 0
+end
+
+function WebBrowser:getWebsiteHistoryEntries()
+    local store = self:getWebsiteHistoryStore()
+    if not store then
+        return {}
+    end
+    local entries = store:getAll()
+    if type(entries) ~= "table" then
+        return {}
+    end
+    return entries
+end
+
+function WebBrowser:addWebsiteHistoryEntry(url, title, metadata)
+    local store = self:getWebsiteHistoryStore()
+    if not store then
+        return
+    end
+    local normalized_url = trim_text(url or "")
+    if normalized_url == "" then
+        return
+    end
+    local sanitized_title = sanitize_plain_text(title) or normalized_url
+    local timestamp = os.time()
+    local entry = {
+        url = normalized_url,
+        title = sanitized_title,
+        opened_at = os.date("%Y-%m-%d %H:%M:%S", timestamp),
+        timestamp = timestamp,
+    }
+    if type(metadata) == "table" then
+        for key, value in pairs(metadata) do
+            if entry[key] == nil and type(value) ~= "function" then
+                entry[key] = value
+            end
+        end
+    end
+    store:addEntry(entry)
+end
+
+function WebBrowser:recordWebsiteVisit(url, title, metadata)
+    local normalized_url = normalize_history_url(url)
+    if not normalized_url then
+        return
+    end
+    local sanitized_title = sanitize_plain_text(title) or normalized_url
+    self:addWebsiteHistoryEntry(normalized_url, sanitized_title, metadata)
+end
+
+function WebBrowser:openWebsiteHistoryEntry(entry)
+    if not entry then
+        UIManager:show(InfoMessage:new {
+            text = _("History entry is missing."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local target_url = trim_text(entry.url or "")
+    if target_url == "" or not target_url:match("^https?://") then
+        UIManager:show(InfoMessage:new {
+            text = _("History URL is missing."),
+            timeout = 2,
+        })
+        return
+    end
+
+    UIManager:nextTick(function()
+        self:openDirectUrl(target_url)
+    end)
+end
+
+function WebBrowser:addSearchHistoryEntry(query, results, engine_display, engine_name, timestamp)
+    local store = self:getSearchHistoryStore()
+    if not store then
+        return
+    end
+    if type(results) ~= "table" or #results == 0 then
+        return
+    end
+    local final_timestamp = timestamp
+    if type(final_timestamp) ~= "number" then
+        final_timestamp = os.time()
+    end
+    local entry = {
+        query = query,
+        engine_display = engine_display,
+        engine_name = engine_name,
+        timestamp = final_timestamp,
+        results = util.tableDeepCopy(results),
+    }
+    local ok, entry_id_or_err = pcall(function()
+        return store:addEntry(entry)
+    end)
+    if not ok then
+        logger.warn("webbrowser", "failed to add search history entry", entry_id_or_err)
+        self.last_history_entry_id = nil
+    else
+        local entry_id = entry_id_or_err
+        if type(entry_id) == "number" then
+            self.last_history_entry_id = entry_id
+        else
+            self.last_history_entry_id = nil
+        end
+    end
+end
+
+function WebBrowser:showSearchHistoryEntry(entry)
+    if not entry or type(entry) ~= "table" then
+        return
+    end
+    local results = entry.results
+    if type(results) ~= "table" or #results == 0 then
+        UIManager:show(InfoMessage:new {
+            text = _("No stored results for this entry."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local query = entry.query or ""
+    local engine_display = entry.engine_display or self:getSearchEngineDisplayName()
+    local engine_name = entry.engine_name or self:getSelectedEngineName()
+
+    self:showResultsMenu(query, results, engine_display, engine_name, { skip_history_record = true })
+end
+
+function WebBrowser:showSearchHistoryDialog()
+    if self.search_history_dialog then
+        UIManager:close(self.search_history_dialog)
+        self.search_history_dialog = nil
+    end
+
+    local store = self:getSearchHistoryStore()
+    local entries = store:getAll()
+    local selection = {}
+
+    local dialog
+    local function clearDialog()
+        self.search_history_dialog = nil
+    end
+
+    local function refreshDialog()
+        UIManager:nextTick(function()
+            self:showSearchHistoryDialog()
+        end)
+    end
+
+    local function formatTimestamp(value)
+        if type(value) == "number" then
+            local formatted = os.date("%Y-%m-%d %H:%M:%S", value)
+            if type(formatted) == "string" then
+                return formatted
+            end
+            return ""
+        end
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+        return ""
+    end
+
+    local buttons = {
+        {
+            {
+                text = _("Delete"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_ids = {}
+                    for _, entry in ipairs(entries) do
+                        local entry_id = entry and entry.id
+                        if entry_id and selection[entry_id] then
+                            table.insert(selected_ids, entry_id)
+                        end
+                    end
+                    if #selected_ids == 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select at least one history entry to delete."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local removed = store:removeByIds(selected_ids)
+                    if removed > 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Selected history entries deleted."),
+                            timeout = 2,
+                        })
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    refreshDialog()
+                end,
+            },
+            {
+                text = _("Copy"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    if not Device:hasClipboard() then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Clipboard not available on this device."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local selected_entry
+                    for _, entry in ipairs(entries) do
+                        local entry_id = entry and entry.id
+                        if entry_id and selection[entry_id] then
+                            selected_entry = entry
+                            break
+                        end
+                    end
+                    if not selected_entry then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select a history entry to copy."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local query_text = selected_entry.query or ""
+                    if query_text == "" then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Selected history entry has no search term to copy."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    Device.input.setClipboardText(query_text)
+                    UIManager:show(InfoMessage:new {
+                        text = _("Search term copied to clipboard."),
+                        timeout = 2,
+                    })
+                end,
+            },
+            {
+                text = _("Open"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_entry
+                    for _, entry in ipairs(entries) do
+                        local entry_id = entry and entry.id
+                        if entry_id and selection[entry_id] then
+                            selected_entry = entry
+                            break
+                        end
+                    end
+                    if not selected_entry then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select a history entry to open."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    UIManager:nextTick(function()
+                        self:showSearchHistoryEntry(selected_entry)
+                    end)
+                end,
+            },
+            {
+                text = _("Close"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    if dialog then
+                        dialog:onClose()
+                        clearDialog()
+                    end
+                end,
+            },
+        },
+    }
+
+    dialog = ButtonDialog:new {
+        title = _("History"),
+        buttons = buttons,
+        tap_close_callback = clearDialog,
+        rows_per_page = {6, 8},
+    }
+
+    self.search_history_dialog = dialog
+
+    local history_container = VerticalGroup:new{}
+
+    if #entries == 0 then
+        local empty_widget = CheckButton:new {
+            text = _("No search history saved yet."),
+            parent = dialog,
+            checkable = false,
+            enabled = false,
+        }
+        empty_widget.not_focusable = true
+        history_container[1] = empty_widget
+    else
+        local threshold_rows = 10
+        local history_group = VerticalGroup:new{}
+        for _i, entry in ipairs(entries) do
+            local entry_id = entry and entry.id
+            if entry_id then
+                selection[entry_id] = false
+                local query_text = entry.query
+                if not query_text or query_text == "" then
+                    query_text = _("(No search term)")
+                end
+                local timestamp_text = formatTimestamp(entry.timestamp)
+                local label
+                if timestamp_text ~= "" then
+                    label = string.format("%s • %s", query_text, timestamp_text)
+                else
+                    label = query_text
+                end
+                local checkbox
+                checkbox = CheckButton:new {
+                    text = label,
+                    parent = dialog,
+                    callback = function()
+                        selection[entry_id] = checkbox.checked
+                    end,
+                }
+                history_group[#history_group + 1] = checkbox
+            end
+        end
+
+        local max_height_ratio = 0.8
+        local screen_height = Screen:getHeight()
+        local max_height = math.floor(screen_height * max_height_ratio)
+        local content_size = history_group:getSize()
+        local needs_scroll = (#entries > threshold_rows) or (content_size.h > max_height)
+
+        if needs_scroll then
+            local final_height = math.min(content_size.h, max_height)
+            local scrollable = ScrollableContainer:new {
+                dimen = Geom:new {
+                    w = dialog.buttontable:getSize().w + ScrollableContainer:getScrollbarWidth(),
+                    h = final_height,
+                },
+                show_parent = dialog,
+                history_group,
+            }
+            history_container[1] = scrollable
+        else
+            history_container[1] = history_group
+        end
+    end
+
+    if history_container[1] then
+        dialog:addWidget(history_container[1])
+    end
+
+    UIManager:show(dialog)
+end
+
+local function copy_file(source_path, destination_path)
+    local source, src_err = io.open(source_path, "rb")
+    if not source then
+        return false, src_err
+    end
+
+    local destination, dst_err = io.open(destination_path, "wb")
+    if not destination then
+        source:close()
+        return false, dst_err
+    end
+
+    while true do
+        local chunk = source:read(8192)
+        if not chunk then
+            break
+        end
+        destination:write(chunk)
+    end
+
+    source:close()
+    destination:close()
+    return true
+end
+
+local function build_unique_file_path(directory, filename)
+    local safe_name = util.getSafeFilename(filename, directory)
+    if safe_name == "" then
+        safe_name = os.date("web_%Y%m%d_%H%M%S")
+    end
+    local name_without_ext, ext = util.splitFileNameSuffix(safe_name)
+    local extension = ext ~= "" and ("." .. ext) or ""
+    local base = name_without_ext ~= "" and name_without_ext or os.date("web_%Y%m%d_%H%M%S")
+    local candidate = string.format("%s/%s%s", directory, base, extension)
+    local counter = 1
+    while util.fileExists(candidate) do
+        candidate = string.format("%s/%s_%d%s", directory, base, counter, extension)
+        counter = counter + 1
+    end
+    return candidate
+end
+
+function WebBrowser:saveExternalUrl(url, context)
+    if type(url) ~= "string" or url == "" then
+        UIManager:show(InfoMessage:new {
+            text = _("Invalid URL."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local target_dir, attempts = self:determineSaveDirectory()
+    if not target_dir then
+        UIManager:show(InfoMessage:new {
+            text = _("Unable to resolve save directory."),
+            timeout = 3,
+        })
+        return
+    end
+
+    if attempts and #attempts > 0 then
+        local failed = attempts[1]
+        if failed and failed.error then
+            UIManager:show(InfoMessage:new {
+                text = _(string.format("Falling back to a different folder. Reason: %s", failed.error)),
+                timeout = 3,
+            })
+        end
+    end
+
+    local renderer = self:getMuPDFRenderer()
+    local info = InfoMessage:new {
+        text = _("Downloading…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local stripped_url = Utils.strip_fragment(url)
+    local ok, stored_path_or_error, headers = renderer:fetchAndStore(stripped_url)
+
+    UIManager:close(info)
+
+    if not ok then
+        UIManager:show(InfoMessage:new {
+            text = stored_path_or_error or _("Failed to save."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local stored_path = stored_path_or_error
+    local filename = stored_path:match("[^/]+$")
+    if not filename then
+        UIManager:show(InfoMessage:new {
+            text = _("Failed to determine saved file name."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local destination_path = build_unique_file_path(target_dir, filename)
+
+    local copied, copy_err = copy_file(stored_path, destination_path)
+    if not copied then
+        UIManager:show(InfoMessage:new {
+            text = _(string.format("Failed to save file: %s", copy_err)),
+            timeout = 3,
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new {
+        text = _(string.format("Saved to %s", destination_path)),
+        timeout = 3,
+    })
+
+    local visit_metadata
+    if type(context) == "table" then
+        visit_metadata = {}
+        if context.source then
+            visit_metadata.source = context.source
+        end
+        visit_metadata.action = context.action or "save"
+    else
+        visit_metadata = { action = "save" }
+    end
+
+    local visit_title
+    if type(context) == "table" and context.title then
+        visit_title = context.title
+    else
+        visit_title = filename
+    end
+
+    self:recordWebsiteVisit(stripped_url, visit_title, visit_metadata)
+end
+
+function WebBrowser:shouldDownloadImages()
+    local value = CONFIG.download_images
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local normalized = value:lower()
+        if normalized == "false" or normalized == "0" or normalized == "no" then
+            return false
+        end
+        if normalized == "true" or normalized == "1" or normalized == "yes" then
+            return true
+        end
+    end
+    return true
+end
+
+function WebBrowser:shouldUseStylesheets()
+    local value = CONFIG.use_stylesheets
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local normalized = value:lower()
+        if normalized == "false" or normalized == "0" or normalized == "no" then
+            return false
+        end
+        if normalized == "true" or normalized == "1" or normalized == "yes" then
+            return true
+        end
+    end
+    return true
+end
+
+function WebBrowser:normalizeUrlInput(input)
+    local trimmed = trim_text(input or "")
+    if trimmed == "" then
+        return nil
+    end
+    if not trimmed:match("^[%a][%w%+%.-]*://") then
+        trimmed = "https://" .. trimmed
+    end
+    return trimmed
+end
+
+function WebBrowser:getRenderType()
+    local render_type = CONFIG.render_type
+    if type(render_type) == "string" then
+        render_type = render_type:lower()
+    end
+    if render_type == "mupdf" then
+        return "mupdf"
+    end
+    if render_type == "cre" then
+        return "cre"
+    end
+    return "markdown"
+end
+
+function WebBrowser:isMarkdownRender()
+    return self:getRenderType() == "markdown"
+end
+
+function WebBrowser:isMuPDFRender()
+    return self:getRenderType() == "mupdf"
+end
+
+function WebBrowser:isCreRender()
+    return self:getRenderType() == "cre"
+end
+
+-- The Markdown renderer converts pages through an online gateway, which by
+-- definition cannot reach a server running on this device. Pages from a local
+-- source (kiwix-serve) therefore go through the HTML renderer instead.
+function WebBrowser:shouldFallBackToCre(url)
+    return self:isMarkdownRender() and Utils.is_loopback_url(url)
+end
+
+function WebBrowser:getCacheDirectory()
+    local custom_dir = CONFIG.cache_directory
+    if type(custom_dir) == "string" then
+        local trimmed = trim_text(custom_dir)
+        if trimmed ~= "" then
+            return trimmed
+        end
+    end
+    return DataStorage:getDataDir() .. "/cache/webbrowser"
+end
+
+function WebBrowser:isCustomCacheDirectory()
+    local custom_dir = CONFIG.cache_directory
+    if type(custom_dir) == "string" then
+        local trimmed = trim_text(custom_dir)
+        if trimmed ~= "" then
+            return true
+        end
+    end
+    return false
+end
+
+function WebBrowser:getMuPDFRenderer()
+    if not self.mupdf_renderer then
+        self.mupdf_renderer = MuPDFRenderer:new {
+            base_dir = self:getCacheDirectory(),
+            keep_old_files = self:shouldKeepOldWebsiteFiles(),
+            download_images = self:shouldDownloadImages(),
+            use_stylesheets = self:shouldUseStylesheets(),
+        }
+    end
+    return self.mupdf_renderer
+end
+
+function WebBrowser:shouldKeepOldWebsiteFiles()
+    local value = CONFIG.keep_old_website_files
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "string" then
+        local normalized = value:lower()
+        return normalized == "true" or normalized == "1" or normalized == "yes"
+    end
+    return false
+end
+
+function WebBrowser:clearMuPDFCache()
+    if not ((self:isMuPDFRender() or self:isCreRender()) and self:shouldKeepOldWebsiteFiles()) then
+        UIManager:show(InfoMessage:new {
+            text = _("Renderer cache clearing is not available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local renderer = self:getMuPDFRenderer()
+    local ok, err = renderer:forceClearCache()
+
+    if ok then
+        UIManager:show(InfoMessage:new {
+            text = _("Cache cleared."),
+            timeout = 2,
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new {
+        text = err or _("Failed to clear cache."),
+        timeout = 3,
+    })
+end
+
+function WebBrowser:ensureMuPDFLinkHandler()
+    if not (self:isMuPDFRender() or self:isCreRender()) then
+        return
+    end
+    if self.mu_pdf_link_handler_registered then
+        return
+    end
+
+    local max_attempts = 20
+
+    local function tryRegister(attempt)
+        if self.mu_pdf_link_handler_registered then
+            return
+        end
+        if not (self:isMuPDFRender() or self:isCreRender()) then
+            return
+        end
+        if not (self.ui and self.ui.link and self.ui.link.addToExternalLinkDialog) then
+            if attempt >= max_attempts then
+                return
+            end
+            UIManager:nextTick(function()
+                tryRegister(attempt + 1)
+            end)
+            return
+        end
+
+        self.ui.link:addToExternalLinkDialog("35_open_here_webbrowser_mupdf", function(external_dialog, link_url)
+            return {
+                text = _("Open here (MuPDF)"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(external_dialog.external_link_dialog)
+                    local target_url = link_url
+                    if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                        return
+                    end
+                    self:runWhenReachable(target_url, function()
+                        self:recordWebsiteVisit(target_url, link_url, {
+                            source = "document",
+                            action = "open",
+                        })
+                        self:loadMuPDFUrl(target_url, false, _("Loading page…"))
+                    end)
+                end,
+                show_in_dialog_func = function()
+                    return type(link_url) == "string" and link_url:match("^https?://") ~= nil and self:isMuPDFRender()
+                end,
+            }
+        end)
+
+        self.ui.link:addToExternalLinkDialog("36_open_here_webbrowser_cre", function(external_dialog, link_url)
+            return {
+                text = _("Open here (CRE)"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(external_dialog.external_link_dialog)
+                    local target_url = link_url
+                    if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                        return
+                    end
+                    self:runWhenReachable(target_url, function()
+                        self:recordWebsiteVisit(target_url, link_url, {
+                            source = "document",
+                            action = "open",
+                        })
+                        self:loadCreUrl(target_url, false, _("Loading page…"))
+                    end)
+                end,
+                show_in_dialog_func = function()
+                    return type(link_url) == "string" and link_url:match("^https?://") ~= nil and self:isCreRender()
+                end,
+            }
+        end)
+
+        local function markdown_link_callback(external_dialog, link_url)
+            UIManager:close(external_dialog.external_link_dialog)
+            local target_url = link_url
+            if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                UIManager:show(InfoMessage:new {
+                    text = _("Markdown URL is missing."),
+                    timeout = 2,
+                })
+                return
+            end
+            self:runWhenReachable(target_url, function()
+                self:downloadMarkdownAndOpen(target_url, link_url, false, {
+            source = "document",
+            action = "markdown",
+        })
+            end)
+        end
+
+        self.ui.link:addToExternalLinkDialog("37_markdown_webbrowser", function(external_dialog, link_url)
+            return {
+                text = _("Markdown (native)"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    markdown_link_callback(external_dialog, link_url)
+                end,
+                show_in_dialog_func = function()
+                    return type(link_url) == "string" and link_url:match("^https?://") ~= nil and (self:isMuPDFRender() or self:isCreRender())
+                end,
+            }
+        end)
+
+        self.ui.link:addToExternalLinkDialog("40_bookmark_webbrowser_mupdf", function(external_dialog, link_url)
+            return {
+                text = _("Bookmark (Browser)"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(external_dialog.external_link_dialog)
+                    local target_url = link_url
+                    if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Bookmark URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    local added, message = self:addBookmarkEntry(target_url)
+                    if message and message ~= "" then
+                        UIManager:show(InfoMessage:new {
+                            text = message,
+                            timeout = 2,
+                        })
+                    end
+                end,
+                show_in_dialog_func = function()
+                    return type(link_url) == "string" and link_url:match("^https?://") ~= nil and (self:isMuPDFRender() or self:isCreRender())
+                end,
+            }
+        end)
+
+        local function save_link_callback(external_dialog, link_url)
+            UIManager:close(external_dialog.external_link_dialog)
+            local target_url = link_url
+            if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                UIManager:show(InfoMessage:new {
+                    text = _("Save URL is missing."),
+                    timeout = 2,
+                })
+                return
+            end
+            self:runWhenReachable(target_url, function()
+                self:saveExternalUrl(target_url, {
+                    title = link_url,
+                    source = "document",
+                    action = "save",
+                })
+            end)
+        end
+
+        self.ui.link:addToExternalLinkDialog("50_save_webbrowser_mupdf", function(external_dialog, link_url)
+            return {
+                text = _("Save"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    save_link_callback(external_dialog, link_url)
+                end,
+                show_in_dialog_func = function()
+                    return type(link_url) == "string" and link_url:match("^https?://") ~= nil and (self:isMuPDFRender() or self:isCreRender())
+                end,
+            }
+        end)
+
+        self.mu_pdf_link_handler_registered = true
+    end
+
+    tryRegister(1)
+end
+
+function WebBrowser:addBookmarkEntry(source_url, title, missing_message)
+    if type(source_url) ~= "string" or source_url == "" then
+        return false, missing_message or _("Bookmark URL is missing.")
+    end
+
+    local store = self:getBookmarksStore()
+    local bookmarks = self:getBookmarks()
+    local normalized_source = Utils.ensure_markdown_gateway(source_url)
+
+    for index, entry in ipairs(bookmarks) do
+        if entry then
+            local existing_source = entry.source_url or entry.url
+            local normalized_existing_source = existing_source and Utils.ensure_markdown_gateway(existing_source)
+            if (existing_source and existing_source == source_url)
+                or (normalized_source and normalized_existing_source and normalized_existing_source == normalized_source)
+                or (title and title ~= "" and entry.title == title) then
+                return false, _("Bookmark already exists.")
+            end
+        end
+    end
+
+    local title_to_save = (title and title ~= "" and title) or source_url
+    local new_entry = {
+        id = Random.uuid(true),
+        title = title_to_save,
+        source_url = source_url,
+    }
+
+    table.insert(bookmarks, 1, new_entry)
+    store:setAll(bookmarks)
+    return true, _("Bookmark added.")
+end
+
+function WebBrowser:openMuPDFDocument(file_path)
+    if type(file_path) ~= "string" or file_path == "" then
+        return
+    end
+    if not is_html_file(file_path) then
+        FileManager:openFile(file_path)
+        return
+    end
+    self:removeSdrDirectoryForPath(file_path)
+    local provider = DocumentRegistry:getProviderFromKey("mupdf")
+    if self.ui.document then
+        self.ui:showReader(file_path, provider, true, true)
+    else
+        self.ui:openFile(file_path, provider)
+    end
+end
+
+function WebBrowser:openCreDocument(file_path)
+    if type(file_path) ~= "string" or file_path == "" then
+        return
+    end
+    if not is_html_file(file_path) then
+        FileManager:openFile(file_path)
+        return
+    end
+    self:removeSdrDirectoryForPath(file_path)
+    local provider = DocumentRegistry:getProviderFromKey("crengine")
+    if not provider then
+        UIManager:show(InfoMessage:new {
+            text = _("CRE provider is not available."),
+            timeout = 2,
+        })
+        return
+    end
+    if self.ui.document then
+        self.ui:showReader(file_path, provider, true, true)
+    else
+        self.ui:openFile(file_path, provider)
+    end
+end
+
+function WebBrowser:loadMuPDFUrl(url, reopen_results, loading_text)
+    if type(url) ~= "string" or url == "" then
+        self:handleFetchError(_("Invalid URL."), reopen_results)
+        return false
+    end
+
+    local stripped_url = Utils.strip_fragment(url)
+
+    self:ensureMuPDFLinkHandler()
+
+    local info
+    if loading_text and loading_text ~= "" then
+        info = InfoMessage:new {
+            text = loading_text,
+            timeout = 0,
+        }
+        UIManager:show(info)
+    end
+
+    local ok, result_or_err = self:getMuPDFRenderer():fetchAndStore(stripped_url)
+
+    if info then
+        UIManager:close(info)
+    end
+
+    if not ok then
+        self:handleFetchError(result_or_err, reopen_results)
+        return false
+    end
+
+    self:openMuPDFDocument(result_or_err)
+    return true
+end
+
+function WebBrowser:loadCreUrl(url, reopen_results, loading_text)
+    if type(url) ~= "string" or url == "" then
+        self:handleFetchError(_("Invalid URL."), reopen_results)
+        return false
+    end
+
+    local stripped_url = Utils.strip_fragment(url)
+
+    self:ensureMuPDFLinkHandler()
+
+    local info
+    if loading_text and loading_text ~= "" then
+        info = InfoMessage:new {
+            text = loading_text,
+            timeout = 0,
+        }
+        UIManager:show(info)
+    end
+
+    local ok, result_or_err = self:getMuPDFRenderer():fetchAndStore(stripped_url)
+
+    if info then
+        UIManager:close(info)
+    end
+
+    if not ok then
+        self:handleFetchError(result_or_err, reopen_results)
+        return false
+    end
+
+    self:openCreDocument(result_or_err)
+    return true
+end
+
+local fetch_markdown
+
+function WebBrowser:openDirectUrl(raw_input)
+    local normalized = self:normalizeUrlInput(raw_input)
+    if not normalized then
+        UIManager:show(InfoMessage:new {
+            text = _("Please enter a valid URL."),
+            timeout = 2,
+        })
+        return
+    end
+
+    self:runWhenReachable(normalized, function()
+        self:recordWebsiteVisit(normalized, normalized, {
+            source = "direct",
+            action = "open",
+        })
+        if self:isMuPDFRender() then
+            self:loadMuPDFUrl(normalized, false, _("Loading page…"))
+            return
+        end
+
+        if self:isCreRender() or self:shouldFallBackToCre(normalized) then
+            self:loadCreUrl(normalized, false, _("Loading page…"))
+            return
+        end
+
+        local gateway_url = Utils.ensure_markdown_gateway(normalized)
+        local info = InfoMessage:new {
+            text = _("Loading page…"),
+            timeout = 0,
+        }
+        UIManager:show(info)
+
+        local markdown, err = fetch_markdown(gateway_url)
+        UIManager:close(info)
+
+        if not markdown then
+            self:handleFetchError(err, false)
+            return
+        end
+
+        self:showMarkdownPage({
+            title = normalized,
+            source_url = normalized,
+            gateway_url = gateway_url,
+            markdown = markdown,
+            source_context = "direct",
+        }, true, true)
+    end)
+end
+
+function WebBrowser:extractEngineTypeFromProfileKey(profile_key)
+    if type(profile_key) ~= "string" then
+        return nil
+    end
+    
+    local normalized = profile_key:lower()
+    
+    if SearchEngines[normalized] then
+        return normalized
+    end
+    
+    for engine_type, _ in pairs(SearchEngines) do
+        if normalized:find("^" .. engine_type) then
+            return engine_type
+        end
+    end
+    
+    local first_part = normalized:match("^([^_]+)")
+    if first_part then
+        for engine_type, _ in pairs(SearchEngines) do
+            if engine_type:find("^" .. first_part) then
+                return engine_type
+            end
+        end
+    end
+    
+    return nil
+end
+
+function WebBrowser:getSelectedEngineName()
+    local selected = CONFIG.engine
+    if type(selected) == "string" then
+        selected = selected:lower()
+    end
+
+    if selected and SearchEngines[selected] then
+        return selected
+    end
+
+    local engines = CONFIG.engines
+    if type(engines) == "table" then
+        for key, _ in pairs(engines) do
+            if type(key) == "string" then
+                local normalized = key:lower()
+                if SearchEngines[normalized] then
+                    return normalized
+                end
+            end
+        end
+    end
+
+    return DEFAULT_SEARCH_ENGINE
+end
+
+function WebBrowser:getSelectedProfileKey()
+    local selected = CONFIG.engine
+    if type(selected) == "string" then
+        return selected:lower()
+    end
+    
+    return self:getSelectedEngineName()
+end
+
+function WebBrowser:getSearchEngineConfig()
+    local engines = CONFIG.engines or {}
+    local profile_key = self:getSelectedProfileKey()
+    local config = engines[profile_key]
+
+    if not config or type(config) ~= "table" then
+        local engine_name = self:getSelectedEngineName()
+        config = engines[engine_name]
+    end
+
+    if not config or type(config) ~= "table" then
+        config = engines[DEFAULT_SEARCH_ENGINE]
+    end
+
+    if not config or type(config) ~= "table" then
+        config = {}
+    end
+
+    return config, profile_key
+end
+
+function WebBrowser:getSearchEngineModule()
+    local config, profile_key = self:getSearchEngineConfig()
+    local engine_type = (config.name and config.name:lower()) or self:extractEngineTypeFromProfileKey(profile_key) or DEFAULT_SEARCH_ENGINE
+    local engine = SearchEngines[engine_type] or SearchEngines[DEFAULT_SEARCH_ENGINE]
+    return engine, config, engine_type
+end
+
+-- True when the given URL is served by this very device, so it stays reachable
+-- with Wi-Fi off. When no URL is given, the selected search engine's endpoint
+-- decides -- that is how a kiwix-serve profile stays usable while offline.
+function WebBrowser:isLocalTarget(url)
+    if type(url) == "string" and url ~= "" then
+        return Utils.is_loopback_url(url)
+    end
+
+    local config = self:getSearchEngineConfig()
+    return config ~= nil and Utils.is_loopback_url(config.base_url)
+end
+
+-- Drop-in replacement for NetworkMgr:runWhenOnline that does not nag for Wi-Fi
+-- when the target is local. Pass the target URL when one is known, or nil to
+-- let the selected engine decide.
+function WebBrowser:runWhenReachable(url, action)
+    if self:isLocalTarget(url) then
+        return action()
+    end
+    return NetworkMgr:runWhenOnline(action)
+end
+
+function WebBrowser:getSearchEngineDisplayName()
+    local config, engine_name = self:getSearchEngineConfig()
+    if config.display_name and config.display_name ~= "" then
+        return config.display_name
+    end
+    if config.name and config.name ~= "" then
+        return config.name:gsub("^%l", string.upper)
+    end
+    if engine_name and engine_name ~= "" then
+        return engine_name:gsub("^%l", string.upper)
+    end
+    return "DuckDuckGo"
+end
+
+fetch_markdown = function(url)
+    local response_chunks = {}
+    socketutil:set_timeout(DEFAULT_TIMEOUT, DEFAULT_MAXTIME)
+    local request = {
+        url = url,
+        method = "GET",
+        sink = ltn12.sink.table(response_chunks),
+        headers = {
+            ["user-agent"] = "Mozilla/5.0 (compatible; KOReader)",
+        },
+    }
+
+    local code, headers, status = socket.skip(1, WebBrowserHttp.request(request))
+    socketutil:reset_timeout()
+
+    if not code then
+        return nil, status or "Request failed"
+    end
+
+    local numeric_code = tonumber(code) or 0
+    if numeric_code < 200 or numeric_code >= 300 then
+        return nil, status or tostring(code)
+    end
+
+    return table.concat(response_chunks), headers
+end
+
+function WebBrowser:onDispatcherRegisterActions()
+    Dispatcher:registerAction("webbrowser_show", {
+        category = "none",
+        event = "ShowWebBrowser",
+        title = _("Web Browser"),
+        general = true,
+    })
+end
+
+function WebBrowser:init()
+    self:onDispatcherRegisterActions()
+    if self.ui.menu then
+        self.ui.menu:registerToMainMenu(self)
+    end
+    self.history = {}
+    self.current_page = nil
+    self.results_menu = nil
+    self.markdown_viewer = nil
+    self.bookmarks_store = BookmarksStore:new()
+    self.bookmarks_dialog = nil
+    self.last_results = nil
+    self.google_results_paging = nil
+    self.brave_results_paging = nil
+    self.last_history_entry_id = nil
+    self.search_history_store = nil
+    self.search_history_dialog = nil
+    self.website_history_store = nil
+    self.website_history_dialog = nil
+    self.website_history_filter_text = nil
+    self:loadSettings()
+    if self.ui.document and self.ui.highlight and self:isHighlightSearchEnabled() then
+        self:addToHighlightDialog()
+    end
+    self.mupdf_renderer = nil
+    self.mu_pdf_link_handler_registered = false
+    if self:isMuPDFRender() or self:isCreRender() then
+        self:ensureMuPDFLinkHandler()
+    end
+end
+
+function WebBrowser:getSettingsFilePath()
+    return DataStorage:getSettingsDir() .. "/webbrowser_settings.lua"
+end
+
+function WebBrowser:getConfigModTime()
+    if CONFIG_MISSING then
+        return 0
+    end
+    
+    local info = debug.getinfo(1, "S")
+    local plugin_path = info.source:match("@(.*/)")
+    if not plugin_path then
+        plugin_path = info.source:match("@(.*\\)")
+    end
+    
+    local config_path
+    if plugin_path then
+        config_path = plugin_path .. "webbrowser_configuration.lua"
+    else
+        config_path = "plugins/webbrowser.koplugin/webbrowser_configuration.lua"
+    end
+    
+    local attributes = lfs.attributes(config_path)
+    
+    if attributes and attributes.modification then
+        return attributes.modification
+    end
+    
+    return 0
+end
+
+function WebBrowser:loadSettings()
+    local settings_path = self:getSettingsFilePath()
+    self.settings = LuaSettings:open(settings_path)
+    
+    if not CONFIG_MISSING then
+        local current_mtime = self:getConfigModTime()
+        local saved_mtime = self.settings:readSetting("config_last_mtime") or 0
+        
+        local config_changed = (current_mtime ~= saved_mtime)
+        
+        if config_changed then
+            self.settings:saveSetting("config_last_mtime", current_mtime)
+            self.settings:saveSetting("engine", CONFIG.engine or DEFAULT_SEARCH_ENGINE)
+            self.settings:flush()
+        else
+            local saved_engine = self.settings:readSetting("engine")
+            if saved_engine and saved_engine ~= "" then
+                CONFIG.engine = saved_engine
+            end
+            
+            local engines = CONFIG.engines or {}
+            for engine_name, engine_config in pairs(engines) do
+                local saved_language = self.settings:readSetting(engine_name .. "_language")
+                if saved_language and saved_language ~= "" then
+                    if engine_name == "duckduckgo" and saved_language:find("-") then
+                        local parts = {}
+                        for part in saved_language:gmatch("[^-]+") do
+                            table.insert(parts, part)
+                        end
+                        if #parts == 2 then
+                            local first, second = parts[1]:lower(), parts[2]:lower()
+                            if #first == 2 and #second == 2 then
+                                local lang_codes = {en=true, pt=true, es=true, fr=true, de=true, it=true, tr=true, ar=true, zh=true, ja=true, ko=true, he=true, el=true, cs=true, da=true, et=true, fi=true, hu=true, id=true, ms=true, nl=true, no=true, pl=true, ro=true, ru=true, sk=true, sl=true, sv=true, th=true, uk=true, vi=true, bg=true, hr=true, lt=true, lv=true, ca=true, tl=true}
+                                local country_codes = {br=true, tr=true, us=true, uk=true, au=true, ca=true, de=true, fr=true, es=true, it=true, nl=true, pl=true, ru=true, jp=true, cn=true, kr=true, ["in"]=true, za=true, mx=true, ar=true, cl=true, co=true, pe=true, ve=true, at=true, be=true, ch=true, cz=true, dk=true, ee=true, fi=true, gr=true, hr=true, hu=true, ie=true, il=true, lt=true, lv=true, no=true, nz=true, ph=true, pt=true, ro=true, se=true, sg=true, sk=true, sl=true, th=true, tw=true, ua=true, vn=true, hk=true, id=true, my=true, bg=true, xa=true, ct=true, xl=true, ue=true, wt=true}
+                                if lang_codes[first] and country_codes[second] then
+                                    engine_config.language = first
+                                    engine_config.country = second
+                                elseif country_codes[first] and lang_codes[second] then
+                                    engine_config.language = second
+                                    engine_config.country = first
+                                else
+                                    engine_config.language = saved_language
+                                end
+                            else
+                                engine_config.language = saved_language
+                            end
+                        else
+                            engine_config.language = saved_language
+                        end
+                    else
+                        engine_config.language = saved_language
+                    end
+                end
+                
+                local saved_country = self.settings:readSetting(engine_name .. "_country")
+                if saved_country and saved_country ~= "" then
+                    engine_config.country = saved_country
+                end
+                
+                local saved_search_depth = self.settings:readSetting(engine_name .. "_search_depth")
+                if saved_search_depth and saved_search_depth ~= "" then
+                    engine_config.search_depth = saved_search_depth
+                end
+                
+                local saved_topic = self.settings:readSetting(engine_name .. "_topic")
+                if saved_topic and saved_topic ~= "" then
+                    engine_config.topic = saved_topic
+                end
+                
+                local saved_search_type = self.settings:readSetting(engine_name .. "_search_type")
+                if saved_search_type and saved_search_type ~= "" then
+                    engine_config.search_type = saved_search_type
+                end
+                
+                local saved_category = self.settings:readSetting(engine_name .. "_category")
+                if saved_category and saved_category ~= "" then
+                    engine_config.category = saved_category
+                end
+                
+                local saved_user_location = self.settings:readSetting(engine_name .. "_user_location")
+                if saved_user_location and saved_user_location ~= "" then
+                    engine_config.user_location = saved_user_location
+                end
+
+                if engine_config.name == "kiwix" then
+                    local saved_base_url = self.settings:readSetting(engine_name .. "_base_url")
+                    if saved_base_url and saved_base_url ~= "" then
+                        engine_config.base_url = saved_base_url
+                    end
+
+                    -- "" was stored deliberately and means "search every archive"
+                    local saved_book_name = self.settings:readSetting(engine_name .. "_book_name")
+                    if saved_book_name then
+                        engine_config.book_name = saved_book_name ~= "" and saved_book_name or nil
+                    end
+                end
+            end
+        end
+    end
+end
+
+function WebBrowser:saveSettings(specific_engine)
+    if not self.settings then
+        return
+    end
+    
+    if not CONFIG_MISSING then
+        if CONFIG.engine then
+            self.settings:saveSetting("engine", CONFIG.engine)
+        end
+        
+        local engines = CONFIG.engines or {}
+        if specific_engine then
+            local engine_config = engines[specific_engine]
+            if engine_config then
+                if engine_config.language then
+                    self.settings:saveSetting(specific_engine .. "_language", engine_config.language)
+                end
+                if engine_config.country then
+                    self.settings:saveSetting(specific_engine .. "_country", engine_config.country)
+                end
+                if engine_config.search_depth then
+                    self.settings:saveSetting(specific_engine .. "_search_depth", engine_config.search_depth)
+                end
+                if engine_config.topic then
+                    self.settings:saveSetting(specific_engine .. "_topic", engine_config.topic)
+                end
+                if engine_config.search_type then
+                    self.settings:saveSetting(specific_engine .. "_search_type", engine_config.search_type)
+                end
+                if engine_config.category then
+                    self.settings:saveSetting(specific_engine .. "_category", engine_config.category)
+                end
+                if engine_config.user_location then
+                    self.settings:saveSetting(specific_engine .. "_user_location", engine_config.user_location)
+                end
+                -- Only kiwix exposes these in the UI. Persisting them for the
+                -- other engines would let a stale value shadow config.lua.
+                if engine_config.name == "kiwix" then
+                    if engine_config.base_url then
+                        self.settings:saveSetting(specific_engine .. "_base_url", engine_config.base_url)
+                    end
+                    -- an empty archive name is a real choice ("search all"),
+                    -- so it has to be written out rather than skipped
+                    self.settings:saveSetting(specific_engine .. "_book_name", engine_config.book_name or "")
+                end
+            end
+        else
+            for engine_name, engine_config in pairs(engines) do
+                if engine_config.language then
+                    self.settings:saveSetting(engine_name .. "_language", engine_config.language)
+                end
+                if engine_config.country then
+                    self.settings:saveSetting(engine_name .. "_country", engine_config.country)
+                end
+                if engine_config.search_depth then
+                    self.settings:saveSetting(engine_name .. "_search_depth", engine_config.search_depth)
+                end
+                if engine_config.topic then
+                    self.settings:saveSetting(engine_name .. "_topic", engine_config.topic)
+                end
+                if engine_config.search_type then
+                    self.settings:saveSetting(engine_name .. "_search_type", engine_config.search_type)
+                end
+                if engine_config.category then
+                    self.settings:saveSetting(engine_name .. "_category", engine_config.category)
+                end
+                if engine_config.user_location then
+                    self.settings:saveSetting(engine_name .. "_user_location", engine_config.user_location)
+                end
+                if engine_config.name == "kiwix" then
+                    if engine_config.base_url then
+                        self.settings:saveSetting(engine_name .. "_base_url", engine_config.base_url)
+                    end
+                    self.settings:saveSetting(engine_name .. "_book_name", engine_config.book_name or "")
+                end
+            end
+        end
+        
+        local current_mtime = self:getConfigModTime()
+        self.settings:saveSetting("config_last_mtime", current_mtime)
+    end
+    
+    self.settings:flush()
+end
+
+function WebBrowser:resetToConfigDefaults()
+    if not self.settings or CONFIG_MISSING then
+        return
+    end
+    
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new {
+        text = _("Reset all settings to config file defaults?\n\nThis will clear your UI preferences and reload settings from webbrowser_configuration.lua."),
+        ok_text = _("Reset"),
+        ok_callback = function()
+            self.settings:delSetting("engine")
+            self.settings:delSetting("config_last_mtime")
+            
+            local engines = CONFIG.engines or {}
+            for engine_name in pairs(engines) do
+                self.settings:delSetting(engine_name .. "_language")
+                self.settings:delSetting(engine_name .. "_country")
+                self.settings:delSetting(engine_name .. "_search_depth")
+                self.settings:delSetting(engine_name .. "_topic")
+                self.settings:delSetting(engine_name .. "_search_type")
+                self.settings:delSetting(engine_name .. "_category")
+                self.settings:delSetting(engine_name .. "_user_location")
+            end
+            
+            self.settings:flush()
+            
+            package.loaded["webbrowser_configuration"] = nil
+            local config_loaded, config_result = pcall(require, "webbrowser_configuration")
+            if config_loaded then
+                for key, value in pairs(config_result) do
+                    CONFIG[key] = value
+                end
+            end
+            
+            if self.search_dialog then
+                UIManager:close(self.search_dialog)
+                self.search_dialog = nil
+            end
+            
+            self:loadSettings()
+            
+            UIManager:show(InfoMessage:new {
+                text = _("Settings reset to config defaults"),
+                timeout = 2,
+            })
+            
+            self:showSearchDialog()
+        end,
+    })
+end
+
+function WebBrowser:getHomeDirectory()
+    if G_reader_settings then
+        local home_dir = G_reader_settings:readSetting("home_dir")
+        if home_dir and home_dir ~= "" then
+            return home_dir
+        end
+    end
+    local default_dir = FileManagerUtil.getDefaultDir and FileManagerUtil.getDefaultDir()
+    return default_dir
+end
+
+function WebBrowser:getCurrentDirectory()
+    if not self.ui then
+        return nil
+    end
+    if self.ui.file_chooser and self.ui.file_chooser.path and self.ui.file_chooser.path ~= "" then
+        return self.ui.file_chooser.path
+    end
+    if self.ui.getLastDirFile then
+        local dir = self.ui:getLastDirFile()
+        if type(dir) == "string" and dir ~= "" then
+            return dir
+        end
+    end
+    return nil
+end
+
+function WebBrowser:determineSaveDirectory()
+    local attempted = {}
+    local candidates = {}
+
+    if CONFIG.save_to_directory and CONFIG.save_to_directory ~= "" then
+        table.insert(candidates, CONFIG.save_to_directory)
+    end
+
+    local home_dir = self:getHomeDirectory()
+    if home_dir and home_dir ~= "" then
+        table.insert(candidates, home_dir)
+    end
+
+    local current_dir = self:getCurrentDirectory()
+    if current_dir and current_dir ~= "" then
+        table.insert(candidates, current_dir)
+    end
+
+    for _, dir in ipairs(candidates) do
+        if dir and dir ~= "" then
+            local ok, err = util.makePath(dir)
+            if ok then
+                return dir, attempted
+            end
+            table.insert(attempted, { path = dir, error = err })
+        end
+    end
+
+    local fallback = lfs.currentdir()
+    util.makePath(fallback)
+    return fallback, attempted
+end
+
+function WebBrowser:generateMarkdownFilename(page, directory, enforce_unique)
+    local unique = enforce_unique ~= false
+    local base = page.title or page.source_url or page.gateway_url or os.date("web_%Y%m%d_%H%M%S")
+    if not base or base == "" then
+        base = os.date("web_%Y%m%d_%H%M%S")
+    end
+    if type(base) ~= "string" then
+        base = tostring(base)
+    end
+    if not base:lower():match("%.md$") then
+        base = base .. ".md"
+    end
+
+    local safe_name = util.getSafeFilename(base, directory)
+    if not safe_name:lower():match("%.md$") then
+        safe_name = safe_name .. ".md"
+    end
+
+    local name_only, ext = util.splitFileNameSuffix(safe_name)
+    local suffix = ext and ext ~= "" and ("." .. ext) or ""
+    if unique then
+        local candidate = safe_name
+        local counter = 1
+        while util.fileExists(directory .. "/" .. candidate) do
+            candidate = string.format("%s_%d%s", name_only, counter, suffix)
+            counter = counter + 1
+        end
+        return candidate
+    end
+
+    return safe_name
+end
+
+function WebBrowser:downloadMarkdownAndOpen(url, title, reopen_results, metadata)
+    local target_url = trim_text(url or "")
+    if target_url == "" or not target_url:match("^https?://") then
+        UIManager:show(InfoMessage:new {
+            text = _("Markdown URL is missing."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local visit_metadata
+    if type(metadata) == "table" then
+        visit_metadata = {}
+        for key, value in pairs(metadata) do
+            if type(value) ~= "function" then
+                visit_metadata[key] = value
+            end
+        end
+        if visit_metadata.action == nil then
+            visit_metadata.action = "markdown"
+        end
+    else
+        visit_metadata = { action = "markdown" }
+    end
+
+    self:recordWebsiteVisit(target_url, title, visit_metadata)
+
+    target_url = Utils.strip_fragment(target_url)
+    local gateway_url = Utils.ensure_markdown_gateway(target_url)
+
+    local info = InfoMessage:new {
+        text = _("Downloading Markdown…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local markdown, err = fetch_markdown(gateway_url)
+    UIManager:close(info)
+
+    if not markdown then
+        self:handleFetchError(err, reopen_results)
+        return
+    end
+
+    local cache_base = self:getCacheDirectory()
+    local markdown_dir = string.format("%s/markdown", cache_base)
+    local created, create_err = util.makePath(markdown_dir)
+    if not created then
+        UIManager:show(InfoMessage:new {
+            text = _(string.format("Failed to prepare markdown directory: %s", create_err or "")),
+            timeout = 3,
+        })
+        return
+    end
+
+    local page = {
+        title = title and trim_text(title) ~= "" and title or target_url,
+        source_url = target_url,
+        gateway_url = gateway_url,
+    }
+
+    local filename = self:generateMarkdownFilename(page, markdown_dir, false)
+    local filepath = string.format("%s/%s", markdown_dir, filename)
+
+    if util.fileExists(filepath) then
+        local removed, remove_err = os.remove(filepath)
+        if not removed then
+            UIManager:show(InfoMessage:new {
+                text = _(string.format("Failed to replace existing file: %s", remove_err or "")),
+                timeout = 3,
+            })
+            return
+        end
+    end
+
+    local base_name = util.splitFileNameSuffix(filename)
+    if base_name and base_name ~= "" then
+        local sdr_path = string.format("%s/%s.sdr", markdown_dir, base_name)
+        local attributes = lfs.attributes(sdr_path)
+        if attributes then
+            local ok_remove, err_remove = pcall(removePath, sdr_path)
+            if not ok_remove then
+                logger.warn("webbrowser", "failed to remove existing markdown SDR", sdr_path, err_remove)
+            end
+        end
+    end
+
+    local file, file_err = io.open(filepath, "w")
+    if not file then
+        UIManager:show(InfoMessage:new {
+            text = _(string.format("Failed to save file: %s", file_err or "")),
+            timeout = 3,
+        })
+        return
+    end
+
+    file:write(markdown)
+    file:close()
+
+    UIManager:show(InfoMessage:new {
+        text = _(string.format("Saved to %s", filepath)),
+        timeout = 3,
+    })
+
+    FileManager:openFile(filepath)
+end
+
+function WebBrowser:addToMainMenu(menu_items)
+    menu_items.webbrowser = {
+        sorting_hint = "search",
+        text = _("Web Browser"),
+        callback = function()
+            self:showSimpleBrowser()
+        end,
+    }
+end
+
+function WebBrowser:onShowWebBrowser()
+    self:showSimpleBrowser()
+end
+
+function WebBrowser:showSimpleBrowser(initial_input)
+    if not self.simple_browser then
+        self.simple_browser = require("webbrowser_remote").new(self)
+    end
+    self.simple_browser:open(initial_input)
+end
+
+-- Turns the current text selection into a search query: cleans it up, collapses
+-- line breaks and keeps it short enough for the search APIs.
+function WebBrowser:getHighlightQuery(reader_highlight)
+    local selected_text = reader_highlight and reader_highlight.selected_text
+    local text = selected_text and selected_text.text
+    if type(text) ~= "string" then
+        return nil
+    end
+
+    text = trim_text(util.cleanupSelectedText(text):gsub("%s+", " "))
+    if text == "" then
+        return nil
+    end
+
+    if #text > HIGHLIGHT_QUERY_MAX_LENGTH then
+        text = text:sub(1, HIGHLIGHT_QUERY_MAX_LENGTH)
+        local truncated_at_space = text:match("^(.*)%s%S*$")
+        if truncated_at_space and truncated_at_space ~= "" then
+            text = truncated_at_space
+        else
+            -- do not leave a cut UTF-8 sequence behind
+            while #text > 0 and text:byte(#text) >= 0x80 and text:byte(#text) <= 0xBF do
+                text = text:sub(1, #text - 1)
+            end
+        end
+        text = trim_text(text)
+    end
+
+    if text == "" then
+        return nil
+    end
+    return text
+end
+
+-- '12_search' is the last core button, '12_1_' keeps ours right before it.
+function WebBrowser:addToHighlightDialog()
+    self.ui.highlight:addToHighlightDialog("12_1_webbrowser_search", function(reader_highlight)
+        return {
+            text = _("Web Search"),
+            callback = function()
+                local query = self:getHighlightQuery(reader_highlight)
+                reader_highlight:onClose()
+                if not query then
+                    UIManager:show(InfoMessage:new {
+                        text = _("No text selected."),
+                        timeout = 2,
+                    })
+                    return
+                end
+                self:runWhenReachable(nil, function()
+                    self:performSearch(query)
+                end)
+            end,
+            hold_callback = function()
+                -- hold to review or edit the selection before searching
+                local query = self:getHighlightQuery(reader_highlight)
+                reader_highlight:onClose()
+                self:showSearchDialog(query)
+            end,
+        }
+    end)
+end
+
+function WebBrowser:showEngineSettings()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local config, profile_key = self:getSearchEngineConfig()
+    local engine_type = self:extractEngineTypeFromProfileKey(profile_key)
+    local engine_display = self:getSearchEngineDisplayName()
+
+    local engine_settings_dialog
+    local buttons = {
+        {
+            {
+                text = _("Select Search Engine"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(engine_settings_dialog)
+                    self:showEngineSelector()
+                end,
+            },
+        },
+    }
+
+    if engine_type == "tavily_api" then
+        table.insert(buttons, {
+            {
+                text = _("Configure Settings"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(engine_settings_dialog)
+                    self:showTavilySettings()
+                end,
+            },
+        })
+    elseif engine_type == "exa_api" then
+        table.insert(buttons, {
+            {
+                text = _("Configure Settings"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(engine_settings_dialog)
+                    self:showExaSettings()
+                end,
+            },
+        })
+    elseif engine_type == "kiwix" then
+        table.insert(buttons, {
+            {
+                text = _("Configure Settings"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(engine_settings_dialog)
+                    self:showKiwixSettings()
+                end,
+            },
+        })
+    elseif engine_type == "brave_api" or engine_type == "google_api" or engine_type == "duckduckgo" then
+        table.insert(buttons, {
+            {
+                text = _("Configure Language/Country"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(engine_settings_dialog)
+                    self:showLanguageSettings()
+                end,
+            },
+        })
+    end
+
+    table.insert(buttons, {
+        {
+            text = _("Reset to Config Defaults"),
+            background = Blitbuffer.COLOR_WHITE,
+            callback = function()
+                UIManager:close(engine_settings_dialog)
+                self:resetToConfigDefaults()
+            end,
+        },
+    })
+
+    engine_settings_dialog = ButtonDialog:new {
+        title = string.format(_("Search Engine: %s"), engine_display),
+        buttons = buttons,
+    }
+    UIManager:show(engine_settings_dialog)
+end
+
+function WebBrowser:showEngineSelector()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local engines = CONFIG.engines or {}
+    local current_profile = self:getSelectedProfileKey()
+    local buttons = {}
+
+    local profile_list = {}
+    for profile_key, engine_config in pairs(engines) do
+        if type(engine_config) == "table" then
+            local is_visible = engine_config.visible
+            if is_visible == nil then
+                is_visible = true
+            end
+            if is_visible then
+                table.insert(profile_list, {
+                    key = profile_key,
+                    config = engine_config,
+                })
+            end
+        end
+    end
+
+    table.sort(profile_list, function(a, b)
+        local type_a = self:extractEngineTypeFromProfileKey(a.key) or ""
+        local type_b = self:extractEngineTypeFromProfileKey(b.key) or ""
+        if type_a ~= type_b then
+            local order = {duckduckgo = 1, brave_api = 2, tavily_api = 3, exa_api = 4, google_api = 5, kiwix = 6}
+            return (order[type_a] or 99) < (order[type_b] or 99)
+        end
+        return a.key < b.key
+    end)
+
+    for idx, profile_entry in ipairs(profile_list) do
+        local profile_key = profile_entry.key
+        local engine_config = profile_entry.config
+        local display_name = engine_config.display_name or profile_key
+        local is_selected = (profile_key == current_profile)
+        local button_text = is_selected and ("✓ " .. display_name) or display_name
+        
+        table.insert(buttons, {{
+            text = button_text,
+            background = Blitbuffer.COLOR_WHITE,
+            callback = function()
+                UIManager:close(self.engine_selector_dialog)
+                if profile_key ~= current_profile then
+                    CONFIG.engine = profile_key
+                    self:saveSettings()
+                    
+                    if self.search_dialog then
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                    end
+                    
+                    UIManager:show(InfoMessage:new {
+                        text = string.format(_("Search engine changed to %s"), display_name),
+                        timeout = 2,
+                    })
+                    
+                    self:showSearchDialog()
+                end
+            end,
+        }})
+    end
+
+    self.engine_selector_dialog = ButtonDialog:new {
+        title = _("Select Search Engine"),
+        buttons = buttons,
+    }
+    UIManager:show(self.engine_selector_dialog)
+end
+
+function WebBrowser:showKiwixSettings()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local config, engine_name = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local base_url = config.base_url or "http://localhost:8888"
+    local archive_label = config.book_name
+    if not archive_label or archive_label == "" then
+        archive_label = _("All archives")
+    end
+
+    local settings_dialog
+    settings_dialog = ButtonDialog:new {
+        title = string.format(_("Kiwix Settings\n\nServer: %s\nArchive: %s"), base_url, archive_label),
+        buttons = {
+            {
+                {
+                    text = _("Change Server Address"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                        self:showKiwixServerDialog()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Select Archive"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                        self:showKiwixArchiveSelector()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Close"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(settings_dialog)
+end
+
+function WebBrowser:showKiwixServerDialog()
+    local config, engine_name = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local server_dialog
+    server_dialog = InputDialog:new {
+        title = _("Kiwix Server Address"),
+        input = config.base_url or "http://localhost:8888",
+        input_hint = "http://localhost:8888",
+        description = _("Address of the kiwix-serve instance. Use localhost when the server runs on this device."),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(server_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local new_base_url = trim_text(server_dialog:getInputText() or "")
+                        UIManager:close(server_dialog)
+                        if new_base_url == "" then
+                            return
+                        end
+                        config.base_url = new_base_url
+                        self:saveSettings(engine_name)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Settings saved successfully"),
+                            timeout = 2,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(server_dialog)
+    server_dialog:onShowKeyboard()
+end
+
+function WebBrowser:showKiwixArchiveSelector()
+    local config, engine_name = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local engine = SearchEngines.kiwix
+    if not engine or not engine.list_archives then
+        return
+    end
+
+    local info = InfoMessage:new {
+        text = _("Reading archive list…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+    local archives, err = engine.list_archives(config)
+    UIManager:close(info)
+
+    if not archives then
+        UIManager:show(InfoMessage:new {
+            text = err or _("Could not read the archive list."),
+            timeout = 5,
+        })
+        return
+    end
+
+    local current = config.book_name
+    local selector_dialog
+
+    local function choose(name)
+        config.book_name = name
+        self:saveSettings(engine_name)
+        UIManager:close(selector_dialog)
+        UIManager:show(InfoMessage:new {
+            text = _("Settings saved successfully"),
+            timeout = 2,
+        })
+    end
+
+    -- an empty archive name means "search everything the server has loaded"
+    local all_selected = (not current or current == "")
+    local buttons = {
+        {
+            {
+                text = all_selected and ("✓ " .. _("All archives")) or _("All archives"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    choose(nil)
+                end,
+            },
+        },
+    }
+
+    for _i, archive in ipairs(archives) do
+        local label = archive.title ~= "" and archive.title or archive.name
+        local details = {}
+        if archive.language and archive.language ~= "" then
+            table.insert(details, archive.language)
+        end
+        if archive.article_count then
+            table.insert(details, string.format(_("%d articles"), archive.article_count))
+        end
+        if #details > 0 then
+            label = string.format("%s (%s)", label, table.concat(details, ", "))
+        end
+        if archive.name == current then
+            label = "✓ " .. label
+        end
+
+        table.insert(buttons, {
+            {
+                text = label,
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    choose(archive.name)
+                end,
+            },
+        })
+    end
+
+    if #archives == 0 then
+        UIManager:show(InfoMessage:new {
+            text = _("The server has no archives loaded."),
+            timeout = 4,
+        })
+        return
+    end
+
+    selector_dialog = ButtonDialog:new {
+        title = _("Select Archive"),
+        buttons = buttons,
+    }
+    UIManager:show(selector_dialog)
+end
+
+function WebBrowser:showTavilySettings()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local config, engine_name = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local fields = {}
+    
+    table.insert(fields, {
+        text = config.search_depth or "basic",
+        hint = _("Search depth (basic, advanced, fast, ultra-fast)"),
+        input_type = "string",
+    })
+    table.insert(fields, {
+        text = config.topic or "general",
+        hint = _("Topic (general, news, finance)"),
+        input_type = "string",
+    })
+    table.insert(fields, {
+        text = config.country or "",
+        hint = _("Country (e.g., turkey, united states) - Not supported with fast/ultra-fast"),
+        input_type = "string",
+    })
+
+    local settings_dialog
+    settings_dialog = MultiInputDialog:new {
+        title = _("Tavily Settings"),
+        fields = fields,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = settings_dialog:getFields()
+                        
+                        local new_search_depth = fields[1] or ""
+                        new_search_depth = new_search_depth:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        local new_topic = fields[2] or ""
+                        new_topic = new_topic:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        local new_country = fields[3] or ""
+                        new_country = new_country:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        if new_search_depth ~= "" then
+                            config.search_depth = new_search_depth
+                        end
+                        
+                        if new_topic ~= "" then
+                            config.topic = new_topic
+                        end
+
+                        if new_search_depth == "fast" or new_search_depth == "ultra-fast" then
+                            config.country = nil
+                        elseif new_country ~= "" then
+                            config.country = new_country
+                        else
+                            config.country = nil
+                        end
+
+                        self:saveSettings(engine_name)
+                        UIManager:close(settings_dialog)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Settings saved successfully"),
+                            timeout = 2,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(settings_dialog)
+    settings_dialog:onShowKeyboard()
+end
+
+function WebBrowser:showExaSettings()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local config, engine_name = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local fields = {}
+    
+    table.insert(fields, {
+        text = config.search_type or "auto",
+        hint = _("Search type (neural, fast, auto, deep-lite, deep, deep-reasoning, instant)"),
+        input_type = "string",
+    })
+    table.insert(fields, {
+        text = config.category or "",
+        hint = _("Category (company, research paper, news, personal site, financial report, people)"),
+        input_type = "string",
+    })
+    table.insert(fields, {
+        text = config.user_location or "",
+        hint = _("User location (2-letter country code, e.g., US, TR, GB)"),
+        input_type = "string",
+    })
+
+    local settings_dialog
+    settings_dialog = MultiInputDialog:new {
+        title = _("Exa Settings"),
+        fields = fields,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = settings_dialog:getFields()
+                        
+                        local new_search_type = fields[1] or ""
+                        new_search_type = new_search_type:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        local new_category = fields[2] or ""
+                        new_category = new_category:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        local new_user_location = fields[3] or ""
+                        new_user_location = new_user_location:gsub("^%s+", ""):gsub("%s+$", "")
+                        
+                        if new_search_type ~= "" then
+                            config.search_type = new_search_type
+                        else
+                            config.search_type = "auto"
+                        end
+                        
+                        if new_category ~= "" then
+                            config.category = new_category
+                        else
+                            config.category = nil
+                        end
+                        
+                        if new_user_location ~= "" then
+                            config.user_location = new_user_location
+                        else
+                            config.user_location = nil
+                        end
+
+                        self:saveSettings(engine_name)
+                        UIManager:close(settings_dialog)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Settings saved successfully"),
+                            timeout = 2,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(settings_dialog)
+    settings_dialog:onShowKeyboard()
+end
+
+function WebBrowser:showLanguageSettings()
+    if CONFIG_MISSING then
+        return
+    end
+
+    local config, profile_key = self:getSearchEngineConfig()
+    if not config then
+        return
+    end
+
+    local engine_type = self:extractEngineTypeFromProfileKey(profile_key)
+    local fields = {}
+    
+    local language_hint, country_hint
+    if engine_type == "brave_api" then
+        language_hint = _("Language (e.g., en, pt, pt-br, en-gb, tr, zh-hans)")
+        country_hint = _("Country (e.g., US, BR, GB, TR, CN, TW)")
+    elseif engine_type == "duckduckgo" then
+        language_hint = _("Language (e.g., en, pt, tr, zh)")
+        country_hint = _("Country (e.g., us, br, tr, cn)")
+    else
+        language_hint = _("Language (e.g., en, pt, tr, zh)")
+        country_hint = _("Country (e.g., us, br, tr, cn)")
+    end
+
+    table.insert(fields, {
+        text = config.language or "en",
+        hint = language_hint,
+        input_type = "string",
+    })
+    table.insert(fields, {
+        text = config.country or "",
+        hint = country_hint,
+        input_type = "string",
+    })
+
+    local settings_dialog
+    settings_dialog = MultiInputDialog:new {
+        title = _("Language & Country Settings"),
+        fields = fields,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = settings_dialog:getFields()
+                        
+                        local new_language = fields[1] or ""
+                        new_language = new_language:gsub("^%s+", ""):gsub("%s+$", "")
+
+                        local new_country = fields[2] or ""
+                        new_country = new_country:gsub("^%s+", ""):gsub("%s+$", "")
+
+                        if new_language ~= "" then
+                            config.language = new_language
+                        end
+                        if new_country ~= "" then
+                            config.country = new_country
+                        end
+
+                        self:saveSettings(profile_key)
+                        UIManager:close(settings_dialog)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Settings saved successfully"),
+                            timeout = 2,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(settings_dialog)
+    settings_dialog:onShowKeyboard()
+end
+
+function WebBrowser:showSearchDialog(initial_input)
+    self:showSimpleBrowser(initial_input)
+end
+
+function WebBrowser:showLegacySearchDialog(initial_input)
+    if CONFIG_MISSING then
+        UIManager:show(InfoMessage:new {
+            text = _("Web browser configuration file not found. Copy 'webbrowser_configuration.sample.lua' to 'webbrowser_configuration.lua' inside the webbrowser plugin folder."),
+            timeout = 10,
+        })
+        return
+    end
+
+    if self.search_dialog and self.search_dialog.dialog_open then
+        return
+    end
+
+    local engine_display = self:getSearchEngineDisplayName()
+
+    self.search_dialog = InputDialog:new {
+        title = string.format(_("%s Search"), engine_display),
+        input = type(initial_input) == "string" and initial_input or "",
+        input_hint = _("Enter keywords or URL"),
+        title_bar_left_icon = "appbar.settings",
+        title_bar_left_icon_tap_callback = function()
+            self.search_dialog:onCloseKeyboard()
+            self:showEngineSettings()
+        end,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                    end,
+                },
+                {
+                    text = _("Search"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local query = self.search_dialog:getInputText() or ""
+                        query = query:gsub("^%s+", ""):gsub("%s+$", "")
+                        if query == "" then
+                            UIManager:show(InfoMessage:new {
+                                text = _("Please enter a search term."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                        self:runWhenReachable(nil, function()
+                            self:performSearch(query)
+                        end)
+                    end,
+                },
+                {
+                    text = _("Go"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        local url_input = self.search_dialog:getInputText() or ""
+                        url_input = trim_text(url_input)
+                        if url_input == "" then
+                            UIManager:show(InfoMessage:new {
+                                text = _("Please enter a URL."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                        self:runWhenReachable(url_input, function()
+                            self:openDirectUrl(url_input)
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Bookmarks"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                        self:showBookmarksDialog()
+                    end,
+                },
+                {
+                    text = _("Clear cache"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    enabled_func = function()
+                        return (self:isMuPDFRender() or self:isCreRender()) and self:shouldKeepOldWebsiteFiles() and not self:isCustomCacheDirectory()
+                    end,
+                    callback = function()
+                        self:clearMuPDFCache()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Search History"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    enabled_func = function()
+                        return self:hasSearchHistoryEntries()
+                    end,
+                    callback = function()
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                        self:showSearchHistoryDialog()
+                    end,
+                },
+                {
+                    text = _("Website History"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    enabled_func = function()
+                        return self:hasWebsiteHistoryEntries()
+                    end,
+                    callback = function()
+                        UIManager:close(self.search_dialog)
+                        self.search_dialog = nil
+                        self:showWebsiteHistoryDialog()
+                    end,
+                },
+            },
+        },
+    }
+
+    UIManager:show(self.search_dialog)
+end
+
+function WebBrowser:performSearch(query)
+    local engine, engine_config, engine_name = self:getSearchEngineModule()
+    local engine_display = self:getSearchEngineDisplayName()
+    local info = InfoMessage:new {
+        text = string.format(_("Searching %s…"), engine_display),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local results, err = engine.search(query, engine_config)
+    UIManager:close(info)
+
+    if not results or #results == 0 then
+        UIManager:show(InfoMessage:new {
+            text = err or _("No results found."),
+            timeout = 15,
+            dismiss_callback = function()
+                return true
+            end,
+        })
+        return
+    end
+
+    self:showResultsMenu(query, results, engine_display, engine_name, { engine_config = engine_config })
+end
+
+function WebBrowser:showResultsMenu(query, results, engine_display, engine_name, options)
+    if self.results_menu then
+        UIManager:close(self.results_menu)
+        self.results_menu = nil
+    end
+
+    local display_name = engine_display or self:getSearchEngineDisplayName()
+    local resolved_engine_name = engine_name or self:getSelectedEngineName()
+    local skip_history_record = options and options.skip_history_record
+    local provided_timestamp = options and options.timestamp
+    local engine_config_option = options and options.engine_config
+
+    local stored_engine_config
+    if engine_config_option then
+        stored_engine_config = util.tableDeepCopy(engine_config_option)
+    end
+
+    self.last_results = {
+        query = query,
+        items = results,
+        engine_display = display_name,
+        engine_name = resolved_engine_name,
+        engine_config = stored_engine_config,
+    }
+
+    if not skip_history_record then
+        self:addSearchHistoryEntry(query, results, display_name, resolved_engine_name, provided_timestamp)
+    end
+
+    local load_more_options
+    if resolved_engine_name == "google_api" and stored_engine_config then
+        self:prepareGooglePaging(query, results, stored_engine_config)
+        self.brave_results_paging = nil
+        self.kiwix_results_paging = nil
+        load_more_options = {
+            text = _("Load more"),
+            enabled = self:canLoadMoreGoogleResults(),
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        }
+    elseif resolved_engine_name == "brave_api" and stored_engine_config then
+        self:prepareBravePaging(query, results, stored_engine_config)
+        self.google_results_paging = nil
+        self.kiwix_results_paging = nil
+        load_more_options = {
+            text = _("Load more"),
+            enabled = self:canLoadMoreBraveResults(),
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        }
+    elseif resolved_engine_name == "kiwix" and stored_engine_config then
+        self:prepareKiwixPaging(query, results, stored_engine_config)
+        self.google_results_paging = nil
+        self.brave_results_paging = nil
+        load_more_options = {
+            text = _("Load more"),
+            enabled = self:canLoadMoreKiwixResults(),
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        }
+    else
+        self.google_results_paging = nil
+        self.brave_results_paging = nil
+        self.kiwix_results_paging = nil
+    end
+
+    local item_table = {}
+    for _, result in ipairs(results) do
+        local entry = self:buildResultMenuEntry(result, resolved_engine_name)
+        if entry then
+            table.insert(item_table, entry)
+        end
+    end
+
+    self.results_menu = Menu:new {
+        title = display_name .. ": " .. query,
+        is_borderless = true,
+        is_popout = false,
+        item_table = item_table,
+        close_callback = function()
+            self.results_menu = nil
+        end,
+        onMenuHold = function(_, item)
+            if item and item.hold_callback then
+                item.hold_callback()
+            end
+        end,
+    }
+
+    if load_more_options then
+        self:updateResultsMenuLoadMore(self.results_menu, load_more_options)
+    else
+        self:updateResultsMenuLoadMore(self.results_menu)
+    end
+
+    UIManager:show(self.results_menu)
+end
+
+function WebBrowser:buildResultMenuEntry(result, engine_name)
+    if not result then
+        return nil
+    end
+
+    local sub_text = result.snippet
+    -- for kiwix, `domain` carries the archive title, which matters when several
+    -- archives are served at once
+    if (engine_name == "brave_api" or engine_name == "kiwix")
+        and result.domain and result.domain ~= "" then
+        if sub_text and sub_text ~= "" then
+            sub_text = string.format("%s\n%s", result.domain, sub_text)
+        else
+            sub_text = result.domain
+        end
+    end
+
+    local display_text = result.title or ""
+    local raw_url = result.url or result.source_url or result.gateway_url
+    local normalized_url = raw_url and Utils.decode_result_url(raw_url)
+    normalized_url = normalized_url and trim_text(normalized_url) or ""
+    -- Every kiwix hit lives on the same local server, so the URL would just
+    -- repeat "http://localhost:8888/content/..." on every row; the archive
+    -- name already went into sub_text above.
+    local show_url = engine_name ~= "kiwix"
+    if show_url and normalized_url ~= "" then
+        if display_text and display_text ~= "" then
+            display_text = string.format("%s — %s", display_text, normalized_url)
+        else
+            display_text = normalized_url
+        end
+    elseif not display_text or display_text == "" then
+        display_text = normalized_url ~= "" and normalized_url or (raw_url or "")
+    end
+
+    return {
+        text = display_text,
+        sub_text = sub_text,
+        callback = function()
+            self:openResult(result)
+        end,
+        hold_callback = function()
+            self:showResultActions(result)
+        end,
+        hold_keep_menu_open = true,
+    }
+end
+
+function WebBrowser:updateResultsMenuLoadMore(menu, options)
+    if not menu or not menu.page_info then
+        return
+    end
+    if options then
+        if not menu._load_more_span then
+            menu._load_more_span = HorizontalSpan:new {
+                width = Screen:scaleBySize(16),
+            }
+        end
+        if not menu._load_more_button then
+            menu._load_more_button = Button:new {
+                text = options.text or _("Load more"),
+                background = Blitbuffer.COLOR_WHITE,
+                bordersize = 0,
+                show_parent = menu.show_parent or menu,
+            }
+        end
+        if options.text then
+            if menu._load_more_button.setText then
+                menu._load_more_button:setText(options.text, menu._load_more_button.width)
+            else
+                menu._load_more_button.text = options.text
+            end
+        end
+        menu._load_more_button.callback = options.callback
+        menu._load_more_button:enableDisable(options.enabled ~= false)
+        if not menu._load_more_inserted then
+            table.insert(menu.page_info, menu._load_more_span)
+            table.insert(menu.page_info, menu._load_more_button)
+            menu._load_more_inserted = true
+        end
+        menu.page_info:resetLayout()
+    else
+        if menu._load_more_inserted then
+            removeWidgetFromGroup(menu.page_info, menu._load_more_button)
+            removeWidgetFromGroup(menu.page_info, menu._load_more_span)
+            menu._load_more_inserted = false
+            menu.page_info:resetLayout()
+        end
+    end
+end
+
+function WebBrowser:getGoogleStartParam(config)
+    local start = tonumber(config and config.start)
+    if start and start > 0 then
+        return math.floor(start)
+    end
+    local offset = tonumber(config and config.offset)
+    if offset and offset >= 0 then
+        return math.floor(offset) + 1
+    end
+    return 1
+end
+
+function WebBrowser:getGoogleBatchSize(config)
+    local size = tonumber(config and config.page_size)
+    if not size or size < 1 then
+        size = GOOGLE_DEFAULT_BATCH_SIZE
+    end
+    if size > GOOGLE_DEFAULT_BATCH_SIZE then
+        size = GOOGLE_DEFAULT_BATCH_SIZE
+    end
+    return size
+end
+
+function WebBrowser:prepareGooglePaging(query, results, config)
+    local effective_config = config or {}
+    local batch_size = self:getGoogleBatchSize(effective_config)
+    local next_start = self:getGoogleStartParam(effective_config) + #results
+    local has_more = (#results >= batch_size) and (next_start <= GOOGLE_API_MAX_TOTAL)
+    self.google_results_paging = {
+        query = query,
+        base_config = util.tableDeepCopy(effective_config),
+        batch_size = batch_size,
+        next_start = next_start,
+        has_more = has_more,
+        history_entry_id = self.last_history_entry_id,
+    }
+end
+
+function WebBrowser:canLoadMoreGoogleResults()
+    local state = self.google_results_paging
+    return state and state.has_more or false
+end
+
+function WebBrowser:getBraveOffset(config)
+    local offset = tonumber(config and config.offset) or 0
+    offset = math.floor(offset)
+    if offset < 0 then
+        offset = 0
+    end
+    return offset
+end
+
+function WebBrowser:getBraveBatchSize(config)
+    local size = tonumber(config and config.page_size)
+    if not size or size < 1 then
+        size = BRAVE_DEFAULT_BATCH_SIZE
+    end
+    if size > 20 then
+        size = 20
+    end
+    return size
+end
+
+function WebBrowser:prepareBravePaging(query, results, config)
+    local effective_config = config or {}
+    local batch_size = self:getBraveBatchSize(effective_config)
+    local next_offset = self:getBraveOffset(effective_config) + #results
+    local metadata = type(results) == "table" and results._metadata
+    local has_more
+    if metadata and metadata.has_more ~= nil then
+        has_more = metadata.has_more
+    elseif metadata and metadata.next_offset ~= nil then
+        has_more = metadata.next_offset > next_offset
+        next_offset = metadata.next_offset
+    else
+        has_more = (#results >= batch_size) and (next_offset < BRAVE_API_MAX_TOTAL)
+    end
+    if metadata and metadata.next_offset ~= nil then
+        next_offset = metadata.next_offset
+    end
+    self.brave_results_paging = {
+        query = query,
+        base_config = util.tableDeepCopy(effective_config),
+        batch_size = batch_size,
+        next_offset = next_offset,
+        has_more = has_more,
+        history_entry_id = self.last_history_entry_id,
+    }
+end
+
+function WebBrowser:canLoadMoreBraveResults()
+    local state = self.brave_results_paging
+    return state and state.has_more or false
+end
+
+function WebBrowser:getKiwixBatchSize(config)
+    local size = tonumber(config and config.max_results)
+    if not size or size < 1 then
+        size = KIWIX_DEFAULT_BATCH_SIZE
+    end
+    if size > KIWIX_MAX_PAGE_LENGTH then
+        size = KIWIX_MAX_PAGE_LENGTH
+    end
+    return math.floor(size)
+end
+
+function WebBrowser:prepareKiwixPaging(query, results, config)
+    local effective_config = config or {}
+    local batch_size = self:getKiwixBatchSize(effective_config)
+    local metadata = type(results) == "table" and results._metadata
+
+    -- kiwix-serve echoes the offset it actually used, which is more reliable
+    -- than whatever we asked for
+    local start_index = (metadata and tonumber(metadata.start_index))
+        or tonumber(effective_config.start_index) or 0
+    local next_start = start_index + #results
+
+    -- the feed reports the full hit count, so "is there more" is exact here
+    local total = metadata and tonumber(metadata.total_results)
+    local has_more
+    if total then
+        has_more = next_start < total
+    else
+        has_more = #results >= batch_size
+    end
+
+    self.kiwix_results_paging = {
+        query = query,
+        base_config = util.tableDeepCopy(effective_config),
+        batch_size = batch_size,
+        next_start = next_start,
+        total_results = total,
+        has_more = has_more,
+        history_entry_id = self.last_history_entry_id,
+    }
+end
+
+function WebBrowser:canLoadMoreKiwixResults()
+    local state = self.kiwix_results_paging
+    return state and state.has_more or false
+end
+
+function WebBrowser:fetchMoreKiwixResults(state)
+    if not state then
+        return
+    end
+    local menu = self.results_menu
+    if not menu then
+        return
+    end
+
+    local engine = SearchEngines.kiwix
+    if not engine then
+        return
+    end
+
+    local function stop(message)
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        if message then
+            UIManager:show(InfoMessage:new {
+                text = message,
+                timeout = 3,
+            })
+        end
+    end
+
+    local request_config = util.tableDeepCopy(state.base_config or {})
+    request_config.start_index = state.next_start
+    request_config.max_results = state.batch_size
+
+    local info = InfoMessage:new {
+        text = _("Loading more results…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local results, err = engine.search(state.query, request_config)
+    UIManager:close(info)
+
+    if not results then
+        stop(err or _("Failed to load more results."))
+        return
+    end
+
+    local received_count = #results
+    if received_count == 0 then
+        stop(_("No more results found."))
+        return
+    end
+
+    if not self.last_results or self.last_results.engine_name ~= "kiwix" then
+        stop(nil)
+        return
+    end
+
+    for _, result in ipairs(results) do
+        table.insert(self.last_results.items, result)
+        table.insert(menu.item_table, self:buildResultMenuEntry(result, self.last_results.engine_name))
+    end
+
+    menu:updateItems()
+
+    state.next_start = state.next_start + received_count
+
+    local metadata = type(results) == "table" and results._metadata
+    local total = (metadata and tonumber(metadata.total_results)) or state.total_results
+    if total then
+        state.total_results = total
+        state.has_more = state.next_start < total
+    else
+        state.has_more = received_count >= state.batch_size
+    end
+
+    self:updateResultsMenuLoadMore(menu, {
+        text = _("Load more"),
+        enabled = state.has_more,
+        callback = function()
+            self:onResultsMenuLoadMore()
+        end,
+    })
+
+    if state.history_entry_id then
+        local store = self:getSearchHistoryStore()
+        if store then
+            local ok, append_err = pcall(function()
+                store:appendResults(state.history_entry_id, results)
+            end)
+            if not ok and append_err then
+                logger.warn("webbrowser", "failed to append search history results", append_err)
+            end
+        end
+    end
+end
+
+function WebBrowser:fetchMoreGoogleResults(state)
+    if not state then
+        return
+    end
+    local menu = self.results_menu
+    if not menu then
+        return
+    end
+
+    local engine = SearchEngines.google_api
+    if not engine then
+        return
+    end
+
+    local request_config = util.tableDeepCopy(state.base_config or {})
+    request_config.start = state.next_start
+    request_config.max_results = state.batch_size
+    request_config.page_size = state.batch_size
+
+    local info = InfoMessage:new {
+        text = _("Loading more results…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local results, err = engine.search(state.query, request_config)
+    UIManager:close(info)
+
+    if not results then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        UIManager:show(InfoMessage:new {
+            text = err or _("Failed to load more results."),
+            timeout = 3,
+        })
+        return
+    end
+
+    if #results == 0 then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        UIManager:show(InfoMessage:new {
+            text = _("No more results found."),
+            timeout = 2,
+        })
+        return
+    end
+
+    if not self.last_results or self.last_results.engine_name ~= "google_api" then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        return
+    end
+
+    for _, result in ipairs(results) do
+        table.insert(self.last_results.items, result)
+        table.insert(menu.item_table, self:buildResultMenuEntry(result, self.last_results.engine_name))
+    end
+
+    menu:updateItems()
+
+    state.next_start = state.next_start + #results
+    if #results < state.batch_size or state.next_start > GOOGLE_API_MAX_TOTAL then
+        state.has_more = false
+    else
+        state.has_more = true
+    end
+
+    self:updateResultsMenuLoadMore(menu, {
+        text = _("Load more"),
+        enabled = state.has_more,
+        callback = function()
+            self:onResultsMenuLoadMore()
+        end,
+    })
+
+    if state.history_entry_id then
+        local store = self:getSearchHistoryStore()
+        if store then
+            local ok, err = pcall(function()
+                store:appendResults(state.history_entry_id, results)
+            end)
+            if not ok and err then
+                logger.warn("webbrowser", "failed to append search history results", err)
+            end
+        end
+    end
+end
+
+function WebBrowser:fetchMoreBraveResults(state)
+    if not state then
+        return
+    end
+    local menu = self.results_menu
+    if not menu then
+        return
+    end
+
+    local engine = SearchEngines.brave_api
+    if not engine then
+        return
+    end
+
+    local request_config = util.tableDeepCopy(state.base_config or {})
+    local clamped_offset = state.next_offset or 0
+    if clamped_offset > BRAVE_API_MAX_TOTAL - state.batch_size then
+        clamped_offset = BRAVE_API_MAX_TOTAL - state.batch_size
+    end
+    if clamped_offset < 0 then
+        clamped_offset = 0
+    end
+    local page_offset = math.floor(clamped_offset / state.batch_size)
+    local max_page = math.floor((BRAVE_API_MAX_TOTAL - 1) / state.batch_size)
+    if page_offset > max_page then
+        page_offset = max_page
+    end
+    if page_offset < 0 then
+        page_offset = 0
+    end
+    request_config.offset = page_offset
+    request_config.max_results = state.batch_size
+    request_config.page_size = state.batch_size
+
+    local info = InfoMessage:new {
+        text = _("Loading more results…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+
+    local results, err = engine.search(state.query, request_config)
+    UIManager:close(info)
+
+    if not results then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        UIManager:show(InfoMessage:new {
+            text = err or _("Failed to load more results."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local metadata = type(results) == "table" and results._metadata
+    local received_count = #results
+
+    if received_count == 0 then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        UIManager:show(InfoMessage:new {
+            text = _("No more results found."),
+            timeout = 2,
+        })
+        return
+    end
+
+    if not self.last_results or self.last_results.engine_name ~= "brave_api" then
+        state.has_more = false
+        self:updateResultsMenuLoadMore(menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+        return
+    end
+
+    for _, result in ipairs(results) do
+        table.insert(self.last_results.items, result)
+        table.insert(menu.item_table, self:buildResultMenuEntry(result, self.last_results.engine_name))
+    end
+
+    menu:updateItems()
+
+    if metadata and metadata.next_offset ~= nil then
+        state.next_offset = tonumber(metadata.next_offset) or state.next_offset
+    else
+        state.next_offset = state.next_offset + received_count
+    end
+
+    if metadata and metadata.has_more ~= nil then
+        state.has_more = metadata.has_more
+    elseif metadata and metadata.total then
+        local total = tonumber(metadata.total) or metadata.total
+        state.has_more = total and state.next_offset < total
+    else
+        if received_count < state.batch_size or state.next_offset >= BRAVE_API_MAX_TOTAL then
+            state.has_more = false
+        else
+            state.has_more = true
+        end
+    end
+
+    self:updateResultsMenuLoadMore(menu, {
+        text = _("Load more"),
+        enabled = state.has_more,
+        callback = function()
+            self:onResultsMenuLoadMore()
+        end,
+    })
+
+    if state.history_entry_id then
+        local store = self:getSearchHistoryStore()
+        if store then
+            local ok, err = pcall(function()
+                store:appendResults(state.history_entry_id, results)
+            end)
+            if not ok and err then
+                logger.warn("webbrowser", "failed to append search history results", err)
+            end
+        end
+    end
+end
+
+function WebBrowser:onResultsMenuLoadMore()
+    if not self.results_menu then
+        return
+    end
+    local last_engine = self.last_results and self.last_results.engine_name
+
+    if last_engine == "google_api" then
+        local state = self.google_results_paging
+        if not state then
+            return
+        end
+
+        if not self:canLoadMoreGoogleResults() then
+            self:updateResultsMenuLoadMore(self.results_menu, {
+                text = _("Load more"),
+                enabled = false,
+                callback = function()
+                    self:onResultsMenuLoadMore()
+                end,
+            })
+            return
+        end
+
+        self:updateResultsMenuLoadMore(self.results_menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+
+        self:runWhenReachable(nil, function()
+            self:fetchMoreGoogleResults(state)
+        end)
+        return
+    end
+
+    if last_engine == "brave_api" then
+        local state = self.brave_results_paging
+        if not state then
+            return
+        end
+
+        if not self:canLoadMoreBraveResults() then
+            self:updateResultsMenuLoadMore(self.results_menu, {
+                text = _("Load more"),
+                enabled = false,
+                callback = function()
+                    self:onResultsMenuLoadMore()
+                end,
+            })
+            return
+        end
+
+        self:updateResultsMenuLoadMore(self.results_menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+
+        self:runWhenReachable(nil, function()
+            self:fetchMoreBraveResults(state)
+        end)
+        return
+    end
+
+    if last_engine == "kiwix" then
+        local state = self.kiwix_results_paging
+        if not state then
+            return
+        end
+
+        if not self:canLoadMoreKiwixResults() then
+            self:updateResultsMenuLoadMore(self.results_menu, {
+                text = _("Load more"),
+                enabled = false,
+                callback = function()
+                    self:onResultsMenuLoadMore()
+                end,
+            })
+            return
+        end
+
+        self:updateResultsMenuLoadMore(self.results_menu, {
+            text = _("Load more"),
+            enabled = false,
+            callback = function()
+                self:onResultsMenuLoadMore()
+            end,
+        })
+
+        self:runWhenReachable(nil, function()
+            self:fetchMoreKiwixResults(state)
+        end)
+    end
+end
+
+function WebBrowser:showResultActions(result)
+    if not result then
+        return
+    end
+
+    local function sanitizeText(value)
+        if type(value) ~= "string" then
+            return nil
+        end
+        local cleaned = util.htmlToPlainTextIfHtml(value)
+        cleaned = trim_text(cleaned)
+        if cleaned == "" then
+            return nil
+        end
+        return cleaned
+    end
+
+    local title = sanitizeText(result.title)
+    local raw_url = result.url or result.source_url or result.gateway_url
+    local decoded_url = raw_url and Utils.decode_result_url(raw_url)
+    local normalized_url = sanitizeText(decoded_url or raw_url)
+    local snippet = sanitizeText(result.snippet)
+
+    local dialog_title = title or normalized_url or _("Search result")
+
+    local info_entries = {}
+    if title and dialog_title ~= title then
+        table.insert(info_entries, title)
+    end
+    if normalized_url and normalized_url ~= "" and dialog_title ~= normalized_url then
+        table.insert(info_entries, normalized_url)
+    end
+    if snippet then
+        table.insert(info_entries, snippet)
+    end
+
+    local bookmark_url = (normalized_url and normalized_url ~= "") and normalized_url or raw_url
+
+    local function getTargetUrl()
+        local target_url = raw_url or decoded_url or normalized_url
+        if type(target_url) ~= "string" then
+            return nil
+        end
+        target_url = trim_text(target_url)
+        if target_url == "" or not target_url:match("^https?://") then
+            return nil
+        end
+        return target_url
+    end
+
+    local rssreader_available = false
+    local rssreader_api = nil
+    do
+        local ok, api = pcall(require, "rssreader_external_api")
+        if ok and api and api.isAvailable() then
+            rssreader_available = true
+            rssreader_api = api
+        end
+    end
+
+    local dialog
+    local buttons = {
+        {
+            {
+                text = _("Go"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(dialog)
+                    self:openResult(result)
+                end,
+            },
+            {
+                text = _("Bookmark"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local added, message = self:addBookmarkEntry(bookmark_url, title, _("Bookmark URL is missing."))
+                    if message and message ~= "" then
+                        UIManager:show(InfoMessage:new {
+                            text = message,
+                            timeout = 2,
+                        })
+                    end
+                    if added then
+                        UIManager:close(dialog)
+                    end
+                end,
+            },
+            {
+                text = _("Close"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    UIManager:close(dialog)
+                end,
+            },
+        },
+        {
+            {
+                text = _("Save"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local target_url = getTargetUrl()
+                    if not target_url then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Save URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    UIManager:close(dialog)
+                    self:runWhenReachable(target_url, function()
+                        self:saveExternalUrl(target_url, {
+                            title = title or normalized_url,
+                            source = "search",
+                            action = "save",
+                        })
+                    end)
+                end,
+            },
+            {
+                text = _("Markdown (native)"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local target_url = getTargetUrl()
+                    if not target_url then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Markdown URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    UIManager:close(dialog)
+                    self:runWhenReachable(target_url, function()
+                        self:downloadMarkdownAndOpen(target_url, title or normalized_url, false, {
+                            source = "search",
+                            action = "markdown",
+                        })
+                    end)
+                end,
+            },
+        },
+    }
+
+    if rssreader_available then
+        table.insert(buttons, {
+            {
+                text = _("Open sanitized"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local target_url = getTargetUrl()
+                    if not target_url then
+                        UIManager:show(InfoMessage:new {
+                            text = _("URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    UIManager:close(dialog)
+                    rssreader_api.openSanitized(target_url, title or normalized_url, function(path, err)
+                        if err then
+                            UIManager:show(InfoMessage:new {
+                                text = string.format(_("Failed to open sanitized: %s"), err),
+                                timeout = 3,
+                            })
+                        end
+                    end)
+                end,
+            },
+            {
+                text = _("Save sanitized"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local target_url = getTargetUrl()
+                    if not target_url then
+                        UIManager:show(InfoMessage:new {
+                            text = _("URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    UIManager:close(dialog)
+                    local save_dir = nil
+                    if CONFIG.save_to_directory and CONFIG.save_to_directory ~= "" then
+                        save_dir = CONFIG.save_to_directory
+                    else
+                        local home_dir = self:getHomeDirectory()
+                        if home_dir and home_dir ~= "" then
+                            save_dir = home_dir
+                        else
+                            local current_dir = self:getCurrentDirectory()
+                            if current_dir and current_dir ~= "" then
+                                save_dir = current_dir
+                            else
+                                save_dir = lfs.currentdir()
+                            end
+                        end
+                    end
+                    
+                    rssreader_api.saveSanitized(target_url, title or normalized_url, save_dir, function(path, err)
+                        if err then
+                            UIManager:show(InfoMessage:new {
+                                text = string.format(_("Failed to save sanitized: %s"), err),
+                                timeout = 3,
+                            })
+                        end
+                    end)
+                end,
+            },
+        })
+    end
+
+    dialog = ButtonDialog:new {
+        title = dialog_title,
+        dismissable = true,
+        buttons = buttons,
+    }
+
+    if #info_entries > 0 then
+        for index, entry_text in ipairs(info_entries) do
+            local info_widget = CheckButton:new {
+                text = entry_text,
+                parent = dialog,
+                checkable = false,
+                enabled = true,
+                dim = false,
+                separator = index < #info_entries,
+            }
+            info_widget.not_focusable = true
+            dialog:addWidget(info_widget)
+        end
+    end
+
+    UIManager:show(dialog)
+end
+
+function WebBrowser:openResultMarkdown(result)
+    local gateway_url = Utils.ensure_markdown_gateway(result.url)
+    local content, err = fetch_markdown(gateway_url)
+    if not content then
+        self:handleFetchError(err, true)
+        return
+    end
+
+    local page = {
+        title = result.title,
+        source_url = result.url,
+        gateway_url = gateway_url,
+        markdown = content,
+        source_context = "search",
+    }
+    self:showMarkdownPage(page, true, true)
+end
+
+function WebBrowser:openResultMuPDF(result)
+    if not result then
+        self:handleFetchError(_("Invalid result."), true)
+        return
+    end
+    local raw_url = result.url or result.gateway_url or result.source_url
+    raw_url = Utils.decode_result_url(raw_url)
+    self:loadMuPDFUrl(raw_url, true, _("Loading page…"))
+end
+
+function WebBrowser:openResultCre(result)
+    if not result then
+        self:handleFetchError(_("Invalid result."), true)
+        return
+    end
+    local raw_url = result.url or result.gateway_url or result.source_url
+    raw_url = Utils.decode_result_url(raw_url)
+    self:loadCreUrl(raw_url, true, _("Loading page…"))
+end
+
+function WebBrowser:openResult(result)
+    local result_url = result and (result.url or result.gateway_url or result.source_url)
+    self:runWhenReachable(Utils.decode_result_url(result_url) or result_url, function()
+        if self.results_menu then
+            UIManager:close(self.results_menu)
+            self.results_menu = nil
+        end
+
+        local raw_url = result.url or result.gateway_url or result.source_url
+        local recorded_url = Utils.decode_result_url(raw_url) or raw_url
+        local visit_title = result.title or recorded_url
+        self:recordWebsiteVisit(recorded_url, visit_title, { source = "search", action = "open" })
+
+        if self:isMuPDFRender() then
+            self:openResultMuPDF(result)
+            return
+        end
+
+        if self:isCreRender() or self:shouldFallBackToCre(recorded_url) then
+            self:openResultCre(result)
+            return
+        end
+
+        self:openResultMarkdown(result)
+    end)
+end
+
+function WebBrowser:showMarkdownPage(page, push_history, refresh_scroll)
+    if push_history and self.current_page then
+        table.insert(self.history, self.current_page)
+    end
+
+    if self.markdown_viewer then
+        self.replacing_viewer = true
+        UIManager:close(self.markdown_viewer)
+        self.markdown_viewer = nil
+    end
+
+    if not page.source_context and self.current_page and self.current_page.source_context then
+        page.source_context = self.current_page.source_context
+    end
+
+    self.current_page = page
+
+    self.markdown_viewer = MarkdownViewer:new {
+        title = page.title or page.source_url,
+        markdown = page.markdown,
+        on_back = function()
+            self:onBack()
+        end,
+        on_link = function(link)
+            self:onLinkTapped(link)
+        end,
+        on_close = function()
+            self:onViewerClosed()
+        end,
+        on_save = function()
+            self:onSaveCurrentPage()
+        end,
+        on_bookmark = function()
+            self:onBookmarkCurrentPage()
+        end,
+    }
+
+    UIManager:show(self.markdown_viewer)
+
+    if refresh_scroll then
+        UIManager:nextTick(function()
+            if self.markdown_viewer and self.markdown_viewer.refreshAfterNavigation then
+                self.markdown_viewer:refreshAfterNavigation()
+            end
+        end)
+    end
+end
+
+function WebBrowser:onViewerClosed()
+    if self.replacing_viewer then
+        self.replacing_viewer = nil
+        return
+    end
+    self.markdown_viewer = nil
+    self.current_page = nil
+    self.history = {}
+end
+
+function WebBrowser:onBack()
+    local current_context = self.current_page and self.current_page.source_context
+    if #self.history == 0 then
+        if self.markdown_viewer then
+            UIManager:close(self.markdown_viewer)
+        end
+        self.markdown_viewer = nil
+        self.current_page = nil
+        local last_results = self.last_results
+        if current_context == "bookmarks" then
+            UIManager:setDirty(nil, "full")
+            UIManager:nextTick(function()
+                self:showBookmarksDialog()
+            end)
+        elseif current_context == "search" and last_results and last_results.items and #last_results.items > 0 then
+            UIManager:nextTick(function()
+                self:showResultsMenu(last_results.query, last_results.items, last_results.engine_display, last_results.engine_name)
+            end)
+        end
+        return
+    end
+
+    local previous = table.remove(self.history)
+    if self.markdown_viewer then
+        UIManager:close(self.markdown_viewer)
+        self.markdown_viewer = nil
+    end
+    self:showMarkdownPage(previous, false, true)
+end
+
+function WebBrowser:onLinkTapped(link)
+    if not self:isMarkdownRender() then
+        return
+    end
+    if type(link) ~= "string" then
+        return
+    end
+
+    if link == "" or not self.current_page then
+        return
+    end
+
+    if link:sub(1, 1) == "#" then
+        return
+    end
+
+    local absolute = Utils.absolute_url(self.current_page.source_url, link)
+    if not absolute or absolute == "" then
+        return
+    end
+
+    local gateway_url = Utils.ensure_markdown_gateway(absolute)
+
+    self:recordWebsiteVisit(absolute, absolute, {
+        source = "document",
+        action = "markdown_link",
+    })
+
+    self:runWhenReachable(absolute, function()
+        local content, err = fetch_markdown(gateway_url)
+        if not content then
+            self:handleFetchError(err, false)
+            return
+        end
+
+        local page = {
+            title = absolute,
+            source_url = absolute,
+            gateway_url = gateway_url,
+            markdown = content,
+            source_context = self.current_page and self.current_page.source_context,
+        }
+        self:showMarkdownPage(page, true, true)
+    end)
+end
+
+function WebBrowser:onSaveCurrentPage()
+    if not self.current_page or not self.current_page.markdown then
+        UIManager:show(InfoMessage:new {
+            text = _("No page loaded."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local target_dir, attempts = self:determineSaveDirectory()
+    if not target_dir then
+        UIManager:show(InfoMessage:new {
+            text = _("Unable to resolve save directory."),
+            timeout = 3,
+        })
+        return
+    end
+
+    if attempts and #attempts > 0 then
+        local failed = attempts[1]
+        if failed and failed.error then
+            UIManager:show(InfoMessage:new {
+                text = _(string.format("Falling back to a different folder. Reason: %s", failed.error)),
+                timeout = 3,
+            })
+        end
+    end
+
+    local filename = self:generateMarkdownFilename(self.current_page, target_dir)
+    local filepath = string.format("%s/%s", target_dir, filename)
+
+    local file, err = io.open(filepath, "w")
+    if not file then
+        UIManager:show(InfoMessage:new {
+            text = _(string.format("Failed to save file: %s", err or "")),
+            timeout = 3,
+        })
+        return
+    end
+
+    file:write(self.current_page.markdown)
+    file:close()
+
+    UIManager:show(InfoMessage:new {
+        text = _(string.format("Saved to %s", filepath)),
+        timeout = 3,
+    })
+end
+
+function WebBrowser:onBookmarkCurrentPage()
+    if not self.current_page then
+        UIManager:show(InfoMessage:new {
+            text = _("No page loaded."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local current_source_url = self.current_page.source_url or self.current_page.gateway_url
+    local current_title = self.current_page.title
+
+    local added, message = self:addBookmarkEntry(current_source_url, current_title, _("Current page URL is missing."))
+    if message and message ~= "" then
+        UIManager:show(InfoMessage:new {
+            text = message,
+            timeout = 2,
+        })
+    end
+end
+
+function WebBrowser:getBookmarksStore()
+    if not self.bookmarks_store then
+        self.bookmarks_store = BookmarksStore:new()
+    end
+    return self.bookmarks_store
+end
+
+function WebBrowser:getBookmarks()
+    local store = self:getBookmarksStore()
+    local entries = store:getAll() or {}
+    local changed = false
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" then
+            if not entry.id or entry.id == "" then
+                entry.id = Random.uuid(true)
+                changed = true
+            end
+            if entry.markdown ~= nil then
+                entry.markdown = nil
+                changed = true
+            end
+            if entry.gateway_url ~= nil then
+                entry.gateway_url = nil
+                changed = true
+            end
+            if entry.source_context ~= nil then
+                entry.source_context = nil
+                changed = true
+            end
+            if entry.url and not entry.source_url then
+                entry.source_url = entry.url
+                changed = true
+            end
+            if entry.url ~= nil then
+                entry.url = nil
+                changed = true
+            end
+        end
+    end
+    if changed then
+        store:setAll(entries)
+    end
+    return entries
+end
+
+function WebBrowser:showAddBookmarkDialog(parent_dialog, clearDialogCallback, filter_text)
+    local add_dialog
+    add_dialog = MultiInputDialog:new {
+        title = _("Add Bookmark"),
+        fields = {
+            {
+                hint = _("Title"),
+                text = "",
+            },
+            {
+                hint = _("URL"),
+                text = "",
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(add_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = add_dialog:getFields()
+                        local title_input = trim_text(fields[1])
+                        local url_input = trim_text(fields[2])
+
+                        if url_input == "" then
+                            UIManager:show(InfoMessage:new {
+                                text = _("Please enter a URL."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+
+                        local normalized_input = Utils.ensure_markdown_gateway(url_input)
+                        local store = self:getBookmarksStore()
+                        local bookmarks = self:getBookmarks()
+
+                        for index, entry in ipairs(bookmarks) do
+                            if entry then
+                                local existing_source = entry.source_url
+                                local normalized_existing_source = existing_source and Utils.ensure_markdown_gateway(existing_source)
+                                if (existing_source and (existing_source == url_input or existing_source == normalized_input))
+                                    or (normalized_existing_source and normalized_existing_source == normalized_input) then
+                                    UIManager:show(InfoMessage:new {
+                                        text = _("Bookmark already exists."),
+                                        timeout = 2,
+                                    })
+                                    return
+                                end
+                            end
+                        end
+
+                        local display_title = title_input ~= "" and title_input or url_input
+                        local new_entry = {
+                            id = Random.uuid(true),
+                            title = display_title,
+                            source_url = url_input,
+                        }
+
+                        table.insert(bookmarks, 1, new_entry)
+                        store:setAll(bookmarks)
+
+                        UIManager:close(add_dialog)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Bookmark added."),
+                            timeout = 2,
+                        })
+
+                        if parent_dialog then
+                            parent_dialog:onClose()
+                            if clearDialogCallback then
+                                clearDialogCallback()
+                            end
+                        end
+
+                        UIManager:nextTick(function()
+                            self:showBookmarksDialog(filter_text)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+
+    UIManager:show(add_dialog)
+    add_dialog:onShowKeyboard()
+end
+
+function WebBrowser:showEditBookmarkDialog(parent_dialog, clearDialogCallback, entry, bookmarks, store, filter_text)
+    if not entry or not entry.id then
+        return
+    end
+
+    local edit_dialog
+    edit_dialog = MultiInputDialog:new {
+        title = _("Edit Bookmark"),
+        fields = {
+            {
+                hint = _("Title"),
+                text = entry.title or "",
+            },
+            {
+                hint = _("URL"),
+                text = entry.source_url or entry.gateway_url or entry.url or "",
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    callback = function()
+                        UIManager:close(edit_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    background = Blitbuffer.COLOR_WHITE,
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = edit_dialog:getFields()
+                        local title_input = trim_text(fields[1])
+                        local url_input = trim_text(fields[2])
+
+                        if url_input == "" then
+                            UIManager:show(InfoMessage:new {
+                                text = _("Please enter a URL."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+
+                        local normalized_input = Utils.ensure_markdown_gateway(url_input)
+
+                        for _i, existing in ipairs(bookmarks) do
+                            if existing and existing.id and existing.id ~= entry.id then
+                                local existing_source = existing.source_url or existing.gateway_url or existing.url
+                                local normalized_existing_source = existing_source and Utils.ensure_markdown_gateway(existing_source)
+                                if (existing_source and (existing_source == url_input or existing_source == normalized_input))
+                                    or (normalized_existing_source and normalized_existing_source == normalized_input) then
+                                    UIManager:show(InfoMessage:new {
+                                        text = _("Bookmark already exists."),
+                                        timeout = 2,
+                                    })
+                                    return
+                                end
+                            end
+                        end
+
+                        local display_title = title_input ~= "" and title_input or url_input
+                        entry.title = display_title
+                        entry.source_url = url_input
+                        entry.gateway_url = nil
+
+                        store:setAll(bookmarks)
+
+                        UIManager:close(edit_dialog)
+                        UIManager:show(InfoMessage:new {
+                            text = _("Bookmark updated."),
+                            timeout = 2,
+                        })
+
+                        if parent_dialog then
+                            parent_dialog:onClose()
+                            if clearDialogCallback then
+                                clearDialogCallback()
+                            end
+                        end
+
+                        UIManager:nextTick(function()
+                            self:showBookmarksDialog(filter_text)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+
+    UIManager:show(edit_dialog)
+    edit_dialog:onShowKeyboard()
+end
+
+function WebBrowser:openBookmarkEntry(entry, bookmarks, store)
+    if not entry then
+        return
+    end
+
+    local url = entry.source_url or entry.url
+    if not url or url == "" then
+        UIManager:show(InfoMessage:new {
+            text = _("Bookmark URL is missing."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local title = entry.title
+    if not title or title == "" then
+        title = url
+        entry.title = title
+        if store and bookmarks then
+            store:setAll(bookmarks)
+        else
+            local bookmarks_store = self:getBookmarksStore()
+            local all_entries = self:getBookmarks()
+            local updated = false
+            for _, existing in ipairs(all_entries) do
+                if existing and existing.id == entry.id then
+                    if not existing.title or existing.title == "" then
+                        existing.title = title
+                        updated = true
+                    end
+                    break
+                end
+            end
+            if updated then
+                bookmarks_store:setAll(all_entries)
+            end
+        end
+    end
+
+    local direct_url = Utils.decode_result_url(url) or url
+
+    self:runWhenReachable(direct_url, function()
+        if self:isMuPDFRender() then
+            self:recordWebsiteVisit(direct_url, title, { source = "bookmarks", action = "open" })
+            self:loadMuPDFUrl(direct_url, false, _("Loading bookmark…"))
+            return
+        end
+
+        if self:isCreRender() or self:shouldFallBackToCre(direct_url) then
+            self:recordWebsiteVisit(direct_url, title, { source = "bookmarks", action = "open" })
+            self:loadCreUrl(direct_url, false, _("Loading bookmark…"))
+            return
+        end
+
+        local gateway_url = Utils.ensure_markdown_gateway(url)
+        local info = InfoMessage:new {
+            text = _("Loading bookmark…"),
+            timeout = 0,
+        }
+        UIManager:show(info)
+
+        local markdown, err = fetch_markdown(gateway_url)
+        UIManager:close(info)
+
+        if not markdown then
+            self:handleFetchError(err, false)
+            return
+        end
+
+        self:showMarkdownPage({
+            title = title,
+            source_url = url,
+            gateway_url = gateway_url,
+            markdown = markdown,
+            source_context = "bookmarks",
+        }, true, true)
+    end)
+end
+
+function WebBrowser:showBookmarksDialog(filter_text)
+    if self.bookmarks_dialog then
+        UIManager:close(self.bookmarks_dialog)
+        self.bookmarks_dialog = nil
+    end
+
+    local store = self:getBookmarksStore()
+    local bookmarks = self:getBookmarks()
+    local selection = {}
+
+    if type(filter_text) == "string" then
+        filter_text = trim_text(filter_text)
+        if filter_text == "" then
+            filter_text = nil
+        end
+    else
+        filter_text = nil
+    end
+
+    local lower_filter = filter_text and filter_text:lower()
+
+    local function matchesFilter(entry)
+        if not lower_filter then
+            return true
+        end
+        local title = (entry.title or ""):lower()
+        local source = (entry.source_url or entry.gateway_url or entry.url or ""):lower()
+        if title ~= "" and title:find(lower_filter, 1, true) then
+            return true
+        end
+        if source ~= "" and source:find(lower_filter, 1, true) then
+            return true
+        end
+        return false
+    end
+
+    local visible_bookmarks = {}
+    for _, entry in ipairs(bookmarks) do
+        if entry and matchesFilter(entry) then
+            table.insert(visible_bookmarks, entry)
+        end
+    end
+
+    local dialog
+    local function clearDialog()
+        self.bookmarks_dialog = nil
+    end
+
+    local buttons = {
+        {
+            {
+                text = _("Delete"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_bookmarks > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_ids = {}
+                    for _, entry in ipairs(bookmarks) do
+                        if entry and entry.id and selection[entry.id] then
+                            table.insert(selected_ids, entry.id)
+                        end
+                    end
+                    if #selected_ids == 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select at least one bookmark to delete."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local removed = store:removeByIds(selected_ids)
+                    if removed > 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Selected bookmarks deleted."),
+                            timeout = 2,
+                        })
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    UIManager:nextTick(function()
+                        self:showBookmarksDialog(filter_text)
+                    end)
+                end,
+            },
+            {
+                text = _("Open"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_bookmarks > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected
+                    for _, entry in ipairs(visible_bookmarks) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected = entry
+                            break
+                        end
+                    end
+                    if not selected then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select a bookmark to open."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    UIManager:nextTick(function()
+                        self:openBookmarkEntry(selected, bookmarks, store)
+                    end)
+                end,
+            },
+            {
+                text = _("Close"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    if dialog then
+                        dialog:onClose()
+                        clearDialog()
+                    end
+                end,
+            },
+        },
+        {
+            {
+                text = _("Edit"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_bookmarks > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected
+                    for _, entry in ipairs(visible_bookmarks) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected = entry
+                            break
+                        end
+                    end
+                    if not selected then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select a bookmark to edit."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    self:showEditBookmarkDialog(dialog, clearDialog, selected, bookmarks, store, filter_text)
+                end,
+            },
+            {
+                text = _("Add"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    self:showAddBookmarkDialog(dialog, clearDialog, filter_text)
+                end,
+            },
+            {
+                text = _("Markdown (native)"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_bookmarks > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected
+                    for _, entry in ipairs(visible_bookmarks) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected = entry
+                            break
+                        end
+                    end
+                    if not selected then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select a bookmark to export."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    local target_url = selected.source_url or selected.gateway_url or selected.url
+                    if not target_url or target_url == "" then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Bookmark URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    UIManager:close(dialog)
+                    clearDialog()
+                    self:runWhenReachable(target_url, function()
+                        self:downloadMarkdownAndOpen(target_url, selected.title, false, {
+                            source = "bookmarks",
+                            action = "markdown",
+                        })
+                    end)
+                end,
+            },
+            {
+                text = _("Filter"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local filter_dialog
+                    filter_dialog = InputDialog:new {
+                        title = _("Filter Bookmarks"),
+                        input = filter_text or "",
+                        buttons = {
+                            {
+                                {
+                                    text = _("Cancel"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    callback = function()
+                                        UIManager:close(filter_dialog)
+                                    end,
+                                },
+                                {
+                                    text = _("Clear Filter"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    callback = function()
+                                        UIManager:close(filter_dialog)
+                                        if dialog then
+                                            dialog:onClose()
+                                            clearDialog()
+                                        end
+                                        UIManager:nextTick(function()
+                                            self:showBookmarksDialog()
+                                        end)
+                                    end,
+                                },
+                                {
+                                    text = _("Filter"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    is_enter_default = true,
+                                    callback = function()
+                                        local value = trim_text(filter_dialog:getInputText() or "")
+                                        UIManager:close(filter_dialog)
+                                        if dialog then
+                                            dialog:onClose()
+                                            clearDialog()
+                                        end
+                                        UIManager:nextTick(function()
+                                            self:showBookmarksDialog(value ~= "" and value or nil)
+                                        end)
+                                    end,
+                                },
+                            },
+                        },
+                    }
+
+                    UIManager:show(filter_dialog)
+                    filter_dialog:onShowKeyboard()
+                end,
+            },
+        },
+    }
+
+    dialog = ButtonDialog:new {
+        title = _("Bookmarks"),
+        buttons = buttons,
+        tap_close_callback = clearDialog,
+        rows_per_page = {6, 8},
+    }
+
+    self.bookmarks_dialog = dialog
+
+    local bookmark_container = VerticalGroup:new {}
+
+    local function buildBookmarksGroup()
+        if #visible_bookmarks == 0 then
+            local empty_text
+            if filter_text then
+                empty_text = _("No bookmarks match the filter.")
+            else
+                empty_text = _("No bookmarks saved yet.")
+            end
+            local empty_widget = CheckButton:new {
+                text = empty_text,
+                parent = dialog,
+                checkable = false,
+                enabled = false,
+            }
+            empty_widget.not_focusable = true
+            return empty_widget
+        end
+
+        local bookmarks_group = VerticalGroup:new{}
+        for _i, entry in ipairs(visible_bookmarks) do
+            local id = entry.id
+            local title = entry.title
+            if not title or title == "" then
+                title = entry.source_url or entry.gateway_url or entry.url or _("(No title)")
+            end
+            local subtitle = entry.source_url or entry.gateway_url or entry.url
+            local label
+            if subtitle and subtitle ~= "" and subtitle ~= title then
+                label = string.format("%s\n%s", title, subtitle)
+            else
+                label = title
+            end
+            selection[id] = false
+            local checkbox
+            checkbox = CheckButton:new {
+                text = label,
+                parent = dialog,
+                callback = function()
+                    selection[id] = checkbox.checked
+                end,
+            }
+            bookmarks_group[#bookmarks_group + 1] = checkbox
+        end
+        return bookmarks_group
+    end
+
+    local content_widget = buildBookmarksGroup()
+
+    local screen_height = Screen:getHeight()
+    local max_height = math.floor(screen_height * 0.7)
+
+    local wrapped_widget
+    if content_widget.getSize then
+        local size = content_widget:getSize()
+        if size.h > max_height then
+            wrapped_widget = ScrollableContainer:new {
+                dimen = Geom:new {
+                    w = dialog.buttontable:getSize().w + ScrollableContainer:getScrollbarWidth(),
+                    h = max_height,
+                },
+                show_parent = dialog,
+                content_widget,
+            }
+        end
+    end
+
+    bookmark_container[1] = wrapped_widget or content_widget
+
+    if bookmark_container[1] then
+        dialog:addWidget(bookmark_container[1])
+    end
+
+    UIManager:show(dialog)
+end
+
+function WebBrowser:showWebsiteHistoryDialog(filter_text)
+    if self.website_history_dialog then
+        UIManager:close(self.website_history_dialog)
+        self.website_history_dialog = nil
+    end
+
+    local store = self:getWebsiteHistoryStore()
+    if not store then
+        return
+    end
+
+    if type(filter_text) == "string" then
+        filter_text = trim_text(filter_text)
+        if filter_text == "" then
+            filter_text = nil
+        end
+    else
+        filter_text = nil
+    end
+
+    self.website_history_filter_text = filter_text
+
+    local lower_filter = filter_text and filter_text:lower()
+
+    local function matchesFilter(entry)
+        if not lower_filter then
+            return true
+        end
+        local title_value = (entry.title or ""):lower()
+        if title_value ~= "" and title_value:find(lower_filter, 1, true) then
+            return true
+        end
+        local url_value = (entry.url or ""):lower()
+        if url_value ~= "" and url_value:find(lower_filter, 1, true) then
+            return true
+        end
+        return false
+    end
+
+    local entries = self:getWebsiteHistoryEntries()
+    local visible_entries = {}
+    for _, entry in ipairs(entries) do
+        if entry and matchesFilter(entry) then
+            table.insert(visible_entries, entry)
+        end
+    end
+
+    local selection = {}
+    local dialog
+
+    local function clearDialog()
+        self.website_history_dialog = nil
+        self.website_history_filter_text = nil
+    end
+
+    local function ensureSelection()
+        for _, entry in ipairs(visible_entries) do
+            if entry and entry.id and selection[entry.id] == nil then
+                selection[entry.id] = false
+            end
+        end
+    end
+    ensureSelection()
+
+    local buttons = {
+        {
+            {
+                text = _("Delete"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local ids = {}
+                    for _, entry in ipairs(visible_entries) do
+                        if entry and entry.id and selection[entry.id] then
+                            table.insert(ids, entry.id)
+                        end
+                    end
+                    if #ids == 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select at least one entry to delete."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local removed = store:removeByIds(ids)
+                    if removed > 0 then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Selected entries deleted."),
+                            timeout = 2,
+                        })
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    UIManager:nextTick(function()
+                        self:showWebsiteHistoryDialog(filter_text)
+                    end)
+                end,
+            },
+            {
+                text = _("Open"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_entry
+                    for _, entry in ipairs(visible_entries) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected_entry = entry
+                            break
+                        end
+                    end
+                    if not selected_entry then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select an entry to open."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    dialog:onClose()
+                    clearDialog()
+                    self:runWhenReachable(selected_entry and selected_entry.url, function()
+                        self:openWebsiteHistoryEntry(selected_entry)
+                    end)
+                end,
+            },
+            {
+                text = _("Close"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    if dialog then
+                        dialog:onClose()
+                        clearDialog()
+                    end
+                end,
+            },
+        },
+        {
+            {
+                text = _("Bookmark"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_entry
+                    for _, entry in ipairs(visible_entries) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected_entry = entry
+                            break
+                        end
+                    end
+                    if not selected_entry then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select an entry to bookmark."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local url_value = selected_entry.url or selected_entry.source_url or selected_entry.gateway_url
+                    local title_value = selected_entry.title or url_value
+                    local added, message = self:addBookmarkEntry(url_value, title_value, _("History URL is missing."))
+                    if message and message ~= "" then
+                        UIManager:show(InfoMessage:new {
+                            text = message,
+                            timeout = 2,
+                        })
+                    end
+                    if added then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Bookmark added."),
+                            timeout = 2,
+                        })
+                    end
+                end,
+            },
+            {
+                text = _("Markdown (native)"),
+                background = Blitbuffer.COLOR_WHITE,
+                enabled = #visible_entries > 0,
+                callback = function()
+                    if not dialog then
+                        return
+                    end
+                    local selected_entry
+                    for _, entry in ipairs(visible_entries) do
+                        if entry and entry.id and selection[entry.id] then
+                            selected_entry = entry
+                            break
+                        end
+                    end
+                    if not selected_entry then
+                        UIManager:show(InfoMessage:new {
+                            text = _("Select an entry to export."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    local target_url = trim_text(selected_entry.url or "")
+                    if target_url == "" then
+                        UIManager:show(InfoMessage:new {
+                            text = _("History URL is missing."),
+                            timeout = 2,
+                        })
+                        return
+                    end
+                    UIManager:close(dialog)
+                    clearDialog()
+                    self:runWhenReachable(target_url, function()
+                        self:downloadMarkdownAndOpen(target_url, selected_entry.title or target_url, false, {
+                            source = "history",
+                            action = "markdown",
+                        })
+                    end)
+                end,
+            },
+            {
+                text = _("Filter"),
+                background = Blitbuffer.COLOR_WHITE,
+                callback = function()
+                    local filter_dialog
+                    filter_dialog = InputDialog:new {
+                        title = _("Filter Website History"),
+                        input = filter_text or "",
+                        buttons = {
+                            {
+                                {
+                                    text = _("Cancel"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    callback = function()
+                                        UIManager:close(filter_dialog)
+                                    end,
+                                },
+                                {
+                                    text = _("Clear Filter"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    callback = function()
+                                        UIManager:close(filter_dialog)
+                                        if dialog then
+                                            dialog:onClose()
+                                            clearDialog()
+                                        end
+                                        UIManager:nextTick(function()
+                                            self:showWebsiteHistoryDialog()
+                                        end)
+                                    end,
+                                },
+                                {
+                                    text = _("Filter"),
+                                    background = Blitbuffer.COLOR_WHITE,
+                                    is_enter_default = true,
+                                    callback = function()
+                                        local value = trim_text(filter_dialog:getInputText() or "")
+                                        UIManager:close(filter_dialog)
+                                        if dialog then
+                                            dialog:onClose()
+                                            clearDialog()
+                                        end
+                                        UIManager:nextTick(function()
+                                            if value ~= "" then
+                                                self:showWebsiteHistoryDialog(value)
+                                            else
+                                                self:showWebsiteHistoryDialog()
+                                            end
+                                        end)
+                                    end,
+                                },
+                            },
+                        },
+                    }
+
+                    UIManager:show(filter_dialog)
+                    filter_dialog:onShowKeyboard()
+                end,
+            },
+        },
+    }
+
+    dialog = ButtonDialog:new {
+        title = _("Website History"),
+        buttons = buttons,
+        tap_close_callback = clearDialog,
+        rows_per_page = {6, 8},
+    }
+
+    self.website_history_dialog = dialog
+
+    local function buildHistoryGroup()
+        if #visible_entries == 0 then
+            local empty_text
+            if filter_text then
+                empty_text = _("No history entries match the filter.")
+            else
+                empty_text = _("No website history recorded yet.")
+            end
+            local empty_widget = CheckButton:new {
+                text = empty_text,
+                parent = dialog,
+                checkable = false,
+                enabled = false,
+            }
+            empty_widget.not_focusable = true
+            return empty_widget
+        end
+
+        local history_group = VerticalGroup:new{}
+        for _i, entry in ipairs(visible_entries) do
+            local id = entry.id
+            selection[id] = selection[id] or false
+
+            local raw_title = trim_text(entry.title or "")
+            local url_value = trim_text(entry.url or "")
+
+            local display_title = raw_title ~= "" and raw_title or nil
+            if display_title and url_value ~= "" and display_title == url_value then
+                display_title = nil
+            end
+
+            local parts = {}
+            local base_title = display_title or (url_value ~= "" and url_value) or _("(No title)")
+            parts[#parts + 1] = base_title
+            if base_title ~= url_value and url_value ~= "" then
+                parts[#parts + 1] = url_value
+            end
+            local timestamp_value
+            if type(entry.timestamp) == "number" then
+                timestamp_value = os.date("%Y-%m-%d %H:%M:%S", entry.timestamp)
+            elseif entry.opened_at and entry.opened_at ~= "" then
+                timestamp_value = entry.opened_at
+            end
+            if timestamp_value and timestamp_value ~= "" then
+                parts[#parts + 1] = timestamp_value
+            end
+
+            local label = table.concat(parts, " • ")
+
+            local checkbox
+            checkbox = CheckButton:new {
+                text = label,
+                parent = dialog,
+                callback = function()
+                    selection[id] = checkbox.checked
+                end,
+            }
+            history_group[#history_group + 1] = checkbox
+        end
+        return history_group
+    end
+
+    local content_widget = buildHistoryGroup()
+    local screen_height = Screen:getHeight()
+    local max_height = math.floor(screen_height * 0.7)
+
+    local wrapped_widget
+    if content_widget.getSize then
+        local size = content_widget:getSize()
+        if size.h > max_height then
+            wrapped_widget = ScrollableContainer:new {
+                dimen = Geom:new {
+                    w = dialog.buttontable:getSize().w + ScrollableContainer:getScrollbarWidth(),
+                    h = max_height,
+                },
+                show_parent = dialog,
+                content_widget,
+            }
+        end
+    end
+
+    dialog:addWidget(wrapped_widget or content_widget)
+
+    UIManager:show(dialog)
+end
+
+function WebBrowser:handleFetchError(err, reopen_results)
+    local message = err or _("Failed to load content.")
+    if message == "wantread" then
+        message = _("Unable to load content. Please check your connection and try again.")
+    end
+    UIManager:show(InfoMessage:new {
+        text = message,
+        timeout = 3,
+    })
+
+    if reopen_results and self.last_results and self.last_results.items and #self.last_results.items > 0 then
+        UIManager:nextTick(function()
+            self:showResultsMenu(self.last_results.query, self.last_results.items, self.last_results.engine_display, self.last_results.engine_name)
+        end)
+    end
+end
+
+return WebBrowser

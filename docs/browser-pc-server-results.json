@@ -1,0 +1,10 @@
+{
+  "live_api_verified": true,
+  "sandboxed_managed_chromium": true,
+  "no_meta_page_image_and_coordinates": true,
+  "authenticated_frame_sha256": true,
+  "focus_change_rejected": true,
+  "cold_open_seconds": 0.796,
+  "frame_bytes": 16561,
+  "book_state_untouched": true
+}

@@ -1,0 +1,19 @@
+{
+  "scenario": "1000 page-update events in 10 seconds; then idle and checkpoint; mocked reader/storage counters, not Kobo timing",
+  "before": {
+    "during_scroll_word_lookups": 65000,
+    "during_scroll_forced_saves": 1000,
+    "total_word_lookups": 65000,
+    "total_forced_saves": 1000,
+    "queued_records": 1000,
+    "source_sha256": "cf6068fbeebaee1e9fd6d046eb2bf51b28be8bf2e2865cefed63245038f278b6"
+  },
+  "after": {
+    "during_scroll_word_lookups": 0,
+    "during_scroll_forced_saves": 0,
+    "total_word_lookups": 65,
+    "total_forced_saves": 1,
+    "queued_records": 1,
+    "source_sha256": "5703d60c5e1cc8b811554ca7b8a963c66fb50d8f662418741dcd06cd991ca87e"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "version": "0.3.1",
+  "version_code": 4,
+  "tested_at": "2026-10-21T01:20:55.767239+00:00",
+  "device": "AOSP Android 11/API 30 x86_64 emulator",
+  "signer_sha256": "a749c286ef957a30a11330ed9c929b9cb5a12b843e0ba0673b804053554c5db2",
+  "apk_sha256": "a4a84f6b313dbf12304f1a8e75e3bfd5275f36a2acd52b1b67c73a711ad0abc7",
+  "online": "INSTRUMENTATION_RESULT: stream=PASS online: revision=runtime-original, start_ms=11437, target_ms=10000, track=1, saved_ms=5000, captions verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "offline": "INSTRUMENTATION_RESULT: stream=PASS offline: revision=runtime-original, start_ms=5049, target_ms=5000, track=1, saved_ms=21578, captions verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "new_handoff": "INSTRUMENTATION_RESULT: stream=PASS new: revision=runtime-next, start_ms=20082, target_ms=20000, track=0, saved_ms=22985, captions verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "background_job": "INSTRUMENTATION_RESULT: stream=PASS background: revision=runtime-background, tracks=1, native JobScheduler download verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "playing_book_captions": "INSTRUMENTATION_RESULT: stream=PASS book_switch: revision=runtime-background, start_ms=20108, target_ms=20000, track=0, saved_ms=20075, captions verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "cold_offline_rewind": "INSTRUMENTATION_RESULT: stream=PASS cold_seek: revision=runtime-switch-next, start_ms=20050, target_ms=20000, track=0, saved_ms=21875, captions verified\n\nINSTRUMENTATION_CODE: -1\n",
+  "pairing_change": "INSTRUMENTATION_RESULT: stream=PASS pairing_change: verified endpoint and token retained through concurrent settings edit; handoff not published\n\nINSTRUMENTATION_CODE: -1\n"
+}
