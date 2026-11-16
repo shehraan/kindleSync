@@ -31,7 +31,7 @@ overnight test so it can receive reading progress before the Kobo sleeps.
 This setup does not promise an exact Android download
 time: Android schedules the app's unmetered background job.
 
-Current PC server address: `http://10.0.0.49:8787` (October 20). It changed
+On October 20, the PC server address was `http://10.0.0.49:8787`. It changed
 from `10.0.0.213`; the router also returned that stale address for the host name.
 Updated Android 0.3 and Kobo plugin clients verify the paired server and search
 its previous private `/24` subnet at the same port. Router access is unnecessary.
@@ -44,6 +44,13 @@ configured plugin ZIP. Installation metadata, scripts and attempt logs are in
 `%LOCALAPPDATA%\KoboSync`; service output is in `data/server.log`. Initial
 "No reading progress received" messages mean the service is waiting for the
 first actual Kobo observation.
+
+As of November 16, the Wi-Fi address is `http://192.168.68.55:8787`. The Kobo's
+saved address and shared discovery module were updated after a network change
+made both audio handoff and browsing search the old `10.0.0.x` subnet. The Kobo
+now checks its current private `/24` as well as the saved one. Android 0.3.1
+needs its server address updated manually when moving to a different subnet.
+See [connection diagnosis and verification](network-troubleshooting.md).
 
 Prepared under `data/setup/`:
 

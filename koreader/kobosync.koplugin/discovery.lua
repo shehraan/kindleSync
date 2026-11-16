@@ -1,4 +1,5 @@
--- Same-subnet recovery for a paired LAN server. Probes never send the token.
+-- Recover a paired LAN server on the saved or current private /24 network.
+-- Probes never send the token.
 local Discovery = {}
 local prefix = "kobosync-discovery-v1\n"
 
@@ -38,10 +39,26 @@ local function nonce()
     return (bytes:gsub(".",function(c) return string.format("%02x",c:byte()) end))
 end
 
+local function current_address(address)
+    local probe
+    local ok,host=pcall(function()
+        probe=require("socket").udp()
+        if not probe or not probe:setpeername(address.host,address.port) then return end
+        -- UDP connect only selects a route: no packet or pairing data is sent.
+        return probe:getsockname()
+    end)
+    if probe then pcall(probe.close,probe) end
+    if ok and type(host)=="string" then
+        return Discovery.private_origin("http://"..host..":"..address.port)
+    end
+end
+
 local function scan(address, hosts, token, challenge, total)
     local socket=require("socket")
     local active, next_host={},1
     local deadline=socket.gettime()+total
+    -- Bound both candidate networks to the existing ten-second scan.
+    local limit=#hosts>254 and 32 or 16
     local function close(client)
         active[client]=nil
         client:close()
@@ -54,7 +71,7 @@ local function scan(address, hosts, token, challenge, total)
             for client,state in pairs(active) do
                 if now>=state.deadline then close(client) else count=count+1 end
             end
-            while count<16 and next_host<=#hosts do
+            while count<limit and next_host<=#hosts do
                 local host=hosts[next_host]; next_host=next_host+1
                 local client=socket.tcp()
                 if client then
@@ -121,11 +138,17 @@ function Discovery.resolve(origin, token)
     if type(token)~="string" or token=="" then return end
     local ok,challenge=pcall(nonce)
     if not ok then return end
-    local current=scan(address,{address.host},token,challenge,0.7)
-    if current then return current end
+    local verified=scan(address,{address.host},token,challenge,0.7)
+    if verified then return verified end
+    local networks={address}
+    local current=current_address(address)
+    if current and current.subnet~=address.subnet then networks={current,address} end
     local hosts={}
     for last=1,254 do
-        if last~=address.last then hosts[#hosts+1]=address.subnet..last end
+        for _,network in ipairs(networks) do
+            local host=network.subnet..last
+            if host~=address.host then hosts[#hosts+1]=host end
+        end
     end
     return scan(address,hosts,token,challenge,10)
 end
