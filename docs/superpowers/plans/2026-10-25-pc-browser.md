@@ -7,8 +7,8 @@ grayscale frames and forwards touch/keyboard actions.
 **Stack:** Python Playwright/Pillow, existing paired HTTP service, KOReader Lua.
 
 The user chose PC-assisted rendering. Execute the authorized implementation,
-using independent backend/client tasks and a final independent review. No usable
-Git repository exists; preserve current files and private settings with backups.
+using independent backend/client tasks and a final independent review. Preserve
+current files and private settings with backups; publish reusable source only.
 
 Review focus: authentication/frame confinement; stale taps and cancelled requests;
 image-heavy memory use; secret field handling; lost sessions/service restarts.
@@ -45,8 +45,10 @@ image-heavy memory use; secret field handling; lost sessions/service restarts.
   a user/device acceptance check, not a claimed automated success.
 - [x] Get an independent review and fix material defects with regressions.
 - [x] Package client/server, document PC requirement and measured limits.
-- [ ] Back up and deploy via existing verified service/device paths; inspect actual
+- [x] Back up and deploy via existing verified service/device paths; inspect actual
   runtime results, then record any final physical interaction still required.
+- [ ] Confirm browsing, search relevance and responsiveness on the physical Kobo
+  after the user restarts KOReader.
 
 ## Execution record
 
@@ -60,5 +62,10 @@ Chromium, authenticated PNG SHA256, legacy-page rendering and focus-change
 rejection; cold open measured 0.796 s. These timings do not establish physical Kobo
 speed or a comparison against the stock browser.
 
-The tested plugin archive and guarded USB updater are ready. The Kobo is not
-currently mounted, so physical installation and on-device acceptance remain.
+On November 16, build 0.9.0-kobosync3 was installed on the physical Libra 2 using
+the guarded USB updater. The previous plugin was backed up, all six installed
+files matched their expected SHA256 hashes, and protected settings, saved browser
+data and KoboSync pairing/state remained unchanged. The Windows proxy health
+check passed. The existing NickelMenu launcher was inspected; automatic boot into
+KOReader is not configured. The user still needs to safely eject/unplug, restart
+KOReader and confirm browsing, search relevance and responsiveness on the device.

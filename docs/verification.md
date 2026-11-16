@@ -342,3 +342,20 @@ challenge was solved or bypassed. Actual post-verification search relevance is
 still an acceptance check for the user on the device. The plugin update is
 packaged, but the Kobo is not mounted for USB installation at this checkpoint.
 See [browser usage and limits](web-browser.md).
+
+## Physical browser update, November 16
+
+Build **0.9.0-kobosync3** was installed on the connected Kobo Libra 2 at
+20:26:22 UTC. The guarded updater backed up the previous browser plugin and
+verified SHA256 hashes for all six installed files. Reader settings, browser
+settings/bookmarks and KoboSync plugin files, pairing and queued state were
+unchanged. The existing Windows proxy returned HTTP 200 from its health endpoint.
+
+The device's NickelMenu entry still launches `koreader.sh` from its main menu.
+Automatic boot into KOReader is not configured; this browser update does not
+change the device's startup sequence. No firmware update package was staged.
+
+The user must safely eject/unplug the Kobo and restart KOReader to load the
+update. Physical browsing, post-verification search relevance and perceived
+speed remain pending user acceptance; installation hashes and desktop tests do
+not establish those results.
