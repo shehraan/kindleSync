@@ -20,7 +20,7 @@ and transcription models are downloaded once; the book text is processed on the
 PC. You can also import matching narration or choose a recording from LibriVox.
 The program does not find commercial audiobooks or borrow titles on your behalf.
 
-**Current verification:** 213 project tests pass, including automatic
+**Current verification:** 245 project tests pass, including automatic
 uploads, edition matching, interrupted registration recovery and narration caching.
 Local Piper has generated a playable MP3 sample. The physical Kobo has
 sent real reading markers; the user confirmed that the OnePlus resumes at the

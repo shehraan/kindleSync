@@ -1,0 +1,21 @@
+{
+  "build": "0.9.0-kobosync4",
+  "unit_tests": 245,
+  "full_suite_passed": true,
+  "full_suite_seconds": 290.238,
+  "controlled_native_scenarios": 13,
+  "controlled_native_passed": true,
+  "controlled_native_seconds": 32.59,
+  "live_native_cycles": 6,
+  "live_native_passed": true,
+  "live_native_seconds": 89.597,
+  "device_files_verified": true,
+  "device_state_preserved": true,
+  "physical_ui_confirmed": false,
+  "simulator_timings_only": true,
+  "live_installed_backend": true,
+  "https_failure_accurate": true,
+  "reload_usable": true,
+  "successful_navigation_recovers": true,
+  "frames_verified": true
+}

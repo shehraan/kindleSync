@@ -359,11 +359,11 @@ class BrowserService:
             client = self._guards[self._page]
         history = await client.send('Page.getNavigationHistory')
         index, entries = history['currentIndex'], history['entries']
-        return index > 0, index + 1 < len(entries)
+        return index > 0, index + 1 < len(entries), entries[index]['url']
 
-    async def _navigate(self, target):
+    async def _navigate(self, operation, *args):
         try:
-            await self._page.goto(target, wait_until='domcontentloaded', timeout=10000)
+            await operation(*args, wait_until='domcontentloaded', timeout=10000)
         except Exception as error:
             # Timeouts still leave a useful, partially loaded real page visible.
             # Never include Playwright's exception text: it can contain private URLs.
@@ -381,6 +381,13 @@ class BrowserService:
         except Exception:
             pass
         await self._page.wait_for_timeout(150)
+        if self._page.url == 'chrome-error://chromewebdata/':
+            _, _, target = await self._history()
+            if urlsplit(target).scheme in ('http', 'https'):
+                # Chromium commits an internal error document after a network or
+                # TLS failure. Keep its history entry and report the web failure.
+                self._notice = 'The website could not finish loading. Check the address or try Reload.'
+                return
         if self._page.url != 'about:blank' and urlsplit(self._page.url).scheme not in ('http', 'https'):
             self._notice = 'Only HTTP and HTTPS website navigation is supported.'
             await self._home()
@@ -393,10 +400,11 @@ class BrowserService:
             page = self._page
             view = await page.evaluate(_VIEW_SCRIPT)
             screenshot = await page.screenshot(type='png', full_page=False, timeout=5000, animations='disabled')
-            can_back, can_forward = await self._history()
+            can_back, can_forward, history_url = await self._history()
             snapshot = await self._focus()
             focus = snapshot['metadata'] if snapshot else {'kind': 'none'}
-            title, url = (await page.title())[:1024], page.url[:4096]
+            title = (await page.title())[:1024]
+            url = (history_url if page.url == 'chrome-error://chromewebdata/' else page.url)[:4096]
             if page == self._page and revision == self._document_revision and view == await page.evaluate(_VIEW_SCRIPT):
                 break
             if snapshot:
@@ -490,7 +498,7 @@ class BrowserService:
             await self._start()
             await self._page.set_viewport_size(self._viewport())
             if target:
-                await self._navigate(target)
+                await self._navigate(self._page.goto, target)
             return await self._capture()
         if action == 'close':
             if data.get('session') == self._session:
@@ -538,7 +546,7 @@ class BrowserService:
             # A failed interaction must not leave its old frame actionable.
             self._generation += 1
         if action == 'navigate':
-            await self._navigate(target)
+            await self._navigate(self._page.goto, target)
         elif action == 'click':
             view = self._display_view
             await self._page.mouse.click(view['x'] + min(data['x'] * view['width'], view['width'] - 1),
@@ -565,22 +573,22 @@ class BrowserService:
         elif action == 'key':
             await self._page.keyboard.press(data['key'])
         elif action == 'back':
-            can_back, _ = await self._history()
+            can_back, _, _ = await self._history()
             if can_back:
-                await self._page.go_back(wait_until='domcontentloaded', timeout=10000)
+                await self._navigate(self._page.go_back)
             elif self._page in self._parents:
                 page = self._page
                 self._page = self._parents[page]
                 await page.close()
         elif action == 'forward':
-            await self._page.go_forward(wait_until='domcontentloaded', timeout=10000)
+            await self._navigate(self._page.go_forward)
         elif action == 'home':
             await self._home()
         elif action == 'reload':
             if self._page.url == 'about:blank':
                 await self._home()
             else:
-                await self._page.reload(wait_until='domcontentloaded', timeout=10000)
+                await self._navigate(self._page.reload)
         elif action == 'zoom':
             self._zoom = data['zoom']
             for page in self._pages:

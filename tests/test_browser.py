@@ -343,6 +343,37 @@ class BrowserRuntimeTests(unittest.TestCase):
         self.assertNotIn('root:', self.service.frame(state['session'], state['generation']).read_bytes().decode(errors='ignore'))
         self.assertIn('notice', state)
 
+    def test_valid_https_failure_reports_loading_problem_and_recovers(self):
+        # This fixture speaks plain HTTP, so HTTPS deterministically fails TLS.
+        target = self.base.replace('http:', 'https:', 1) + '/?private=do-not-repeat-in-notice'
+        session = self.state['session']
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                state = self.act('navigate', input=target)
+                self.assertIn('loading', state.get('notice', '').lower())
+                self.assertNotIn('HTTP and HTTPS', state['notice'])
+                self.assertNotIn('do-not-repeat-in-notice', state['notice'])
+                self.assertEqual(state['session'], session)
+                self.assertEqual(state['url'], target)
+                self.assertTrue(self.service.frame(state['session'], state['generation']).is_file())
+        recovered = self.act('navigate', input=self.base + '/second')
+        self.assertEqual(recovered['title'], 'Second page')
+        self.assertEqual(recovered['session'], session)
+        self.assertNotIn('notice', recovered)
+
+    def test_failed_https_navigation_keeps_reload_and_history_usable(self):
+        target = self.base.replace('http:', 'https:', 1) + '/'
+        self.act('navigate', input=target)
+        self.assertEqual(self.act('back')['title'], 'JavaScript active')
+        failed = self.act('forward')
+        self.assertEqual(failed['url'], target)
+        self.assertIn('loading', failed.get('notice', '').lower())
+        self.assertEqual(self.act('refresh')['url'], target)
+        reloaded = self.act('reload')
+        self.assertEqual(reloaded['url'], target)
+        self.assertIn('loading', reloaded.get('notice', '').lower())
+        self.assertEqual(self.act('back')['title'], 'JavaScript active')
+
     def test_malformed_action_values_return_input_errors_without_invalidating_frame(self):
         for values in [dict(action=[]), dict(action='key', key=[]), dict(action='open', width=True),
                        dict(action='click', x=float('nan'), y=.5), dict(action='navigate', input=['private'])]:

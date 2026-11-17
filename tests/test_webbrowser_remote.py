@@ -377,6 +377,14 @@ browser.discovery.resolve=function(server,token) verified=verified+1;return serv
 browser:open();assert(verified==1,'Reopening reused an old PC identity proof')
 ''')
 
+    def test_home_address_box_is_ready_for_a_website_without_internal_uri(self):
+        self.load()
+        self.lua.execute(r'''
+browser.page.url='about:blank'
+browser:editAddress()
+assert(dialogs[#dialogs].input=='','Home prefilled an internal URI that rejects an ordinary website address')
+''')
+
 
 @unittest.skipUnless(LuaRuntime, 'Install dev extra for remote browser tests')
 class RemoteViewTests(unittest.TestCase):

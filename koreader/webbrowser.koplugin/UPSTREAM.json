@@ -8,7 +8,8 @@
     "DuckDuckGo Lite/HTML compatibility and blocked-response handling retained.",
     "Unified browser window with Back/Forward/Home/Reload, editable address bar, scroll restoration, bookmarks, and cancellable loading.",
     "Legacy text browser retained for provenance; normal browser/search entries use a paired private Chromium session on the PC.",
-    "Bounded authenticated grayscale frames, native Kobo touch and keyboard controls, browser history, zoom and preserved bookmarks."
+    "Bounded authenticated grayscale frames, native Kobo touch and keyboard controls, browser history, zoom and preserved bookmarks.",
+    "Render-aware request deadlines, an empty home address field, and accurate HTTPS load-error handling."
   ],
-  "local_build": "0.9.0-kobosync3"
+  "local_build": "0.9.0-kobosync4"
 }

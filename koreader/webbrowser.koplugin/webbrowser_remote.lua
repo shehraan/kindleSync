@@ -203,6 +203,8 @@ end
 
 function Remote:editAddress()
     if not self.visible or self.busy then return end
+    local address=self.page and self.page.url or ''
+    if not address:match('^https?://') then address='' end
     local dialog
     local function go(engine)
         local value=dialog:getInputText()
@@ -210,7 +212,7 @@ function Remote:editAddress()
         self:navigate(value,engine)
     end
     dialog=InputDialog:new{
-        title='Search or enter address',input=self.page and self.page.url or '',input_hint='Search words or example.org',
+        title='Search or enter address',input=address,input_hint='Search words or example.org',
         buttons={
             {{text='Cancel',callback=function() UIManager:close(dialog);self.dialog=nil end},
              {text='Clear',callback=function() dialog:setInputText('') end},

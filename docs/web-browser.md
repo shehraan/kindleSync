@@ -81,7 +81,17 @@ pairing, never the live reading library. Runtime receipts and screenshots are in
 Desktop simulation does not establish physical Kobo latency or ghosting.
 
 The upstream plugin base and licenses remain recorded in `UPSTREAM.json`.
-Local build **0.9.0-kobosync3** adds PC-assisted browsing. The public plugin
+Local build **0.9.0-kobosync4** includes the browser error fixes verified on
+November 16. Rendering requests allow the PC's existing 35-second action budget;
+image downloads retain a five-second stall limit and the loading dialog remains
+cancellable. A slow render is not immediately reported as an offline PC.
+
+The home address field starts empty. Failed HTTPS pages retain their attempted
+website address, a loading-error notice and usable history/Reload, instead of
+being misreported as unsupported HTTP/HTTPS navigation. TLS verification remains
+enabled. See [reproduction and verification](browser-recovery.md).
+
+The public plugin
 archive is `dist/webbrowser-koreader-plugin.zip`; the device updater backs up the
 existing plugin and preserves browser settings, bookmarks, menu order and
 KoboSync state.

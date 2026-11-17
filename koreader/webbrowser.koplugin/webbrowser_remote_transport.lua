@@ -90,7 +90,12 @@ local function frameMetadata(value)
 end
 
 local function request(origin, token, method, path, body, sink, closing)
-    socketutil:set_timeout(closing and 2 or 5,closing and 4 or 55)
+    -- Rendering can take up to 35 seconds on the PC, including a cold engine
+    -- start. Waiting only five seconds for response headers falsely marked a
+    -- reachable PC offline. Image transfers retain their short stall timeout;
+    -- the cancellable UI worker still owns the whole operation.
+    local block_timeout=method=='POST' and 40 or 5
+    socketutil:set_timeout(closing and 2 or block_timeout,closing and 4 or 55)
     -- A paired LAN endpoint must not inherit the reader's optional website
     -- proxy: that would disclose its bearer token to the proxy operator.
     local socket_http=package.loaded['socket.http']
@@ -104,11 +109,16 @@ local function request(origin, token, method, path, body, sink, closing)
     })
     if socket_http then socket_http.PROXY=proxy end
     socketutil:reset_timeout()
-    if not ok or not received then return nil,UNAVAILABLE end
+    if not ok then return nil,'The browser request failed on the Kobo. Close the browser and try again.' end
+    if not received then
+        if code=='timeout' then return nil,'The PC browser request timed out. Try Refresh.' end
+        return nil,UNAVAILABLE
+    end
     code=tonumber(code)
     if code~=200 then
         if code==401 then return nil,'The PC rejected your KoboSync pairing token.',code end
         if code==409 then return nil,'The page changed. Refreshing the view.',code end
+        if code and code>=500 then return nil,'Your PC is reachable, but its browser could not finish this action. Try Refresh.',code end
         return nil,'The PC browser could not complete this action. Try Refresh.',code
     end
     return true,nil,code,headers

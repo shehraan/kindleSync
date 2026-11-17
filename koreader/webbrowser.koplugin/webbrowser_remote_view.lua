@@ -26,6 +26,8 @@ function View:init()
     local width,height=Screen:getWidth(),Screen:getHeight()
     self.dimen=Geom:new{x=0,y=0,w=width,h=height}
     local page=self.page
+    local address=page and page.url or ''
+    if not address:match('^https?://') then address='' end
     local titlebar=TitleBar:new{
         width=width,title=page and page.title~='' and page.title or 'PC Web Browser',
         title_shrink_font_to_fit=true,align='left',with_bottom_line=true,
@@ -46,7 +48,7 @@ function View:init()
     }
     self.address_table=ButtonTable:new{
         width=width,zero_sep=true,show_parent=self,
-        buttons={{button('remote_address',page and page.url~='' and page.url or 'Search or enter address',self.on_address)}},
+        buttons={{button('remote_address',address~='' and address or 'Search or enter address',self.on_address)}},
     }
     self.controls=ButtonTable:new{
         width=width,zero_sep=true,show_parent=self,
