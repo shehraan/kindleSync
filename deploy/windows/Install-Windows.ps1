@@ -19,7 +19,7 @@ if ($PlanOnly) {
         LogonType = 'Interactive; no password stored'
         Executable = $definition.Actions[0].Execute
         Arguments = $definition.Actions[0].Arguments
-        Triggers = @('At logon', 'Daily 05:50 local')
+        Triggers = @('At logon', 'Daily 06:00 local')
         ExecutionTimeLimit = $definition.Settings.ExecutionTimeLimit
         WakeToRun = $definition.Settings.WakeToRun
         Network = $plan

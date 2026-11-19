@@ -52,13 +52,13 @@ function New-KoboSyncTaskDefinition($Configuration) {
     $executable = Join-Path ([Environment]::GetFolderPath('System')) 'wsl.exe'
     $action = New-ScheduledTaskAction -Execute $executable -Argument (Get-KoboSyncLaunchArguments $Configuration)
     $principal = New-ScheduledTaskPrincipal -UserId $Configuration.WindowsUserSid -LogonType Interactive -RunLevel Limited
-    $daily = New-ScheduledTaskTrigger -Daily -At '05:50'
+    $daily = New-ScheduledTaskTrigger -Daily -At '06:00'
     # Omit the UTC suffix/offset so Task Scheduler keeps local wall time across
     # daylight-saving transitions instead of fixing today's UTC equivalent.
-    $daily.StartBoundary = [DateTime]::Today.AddHours(5).AddMinutes(50).ToString('yyyy-MM-ddTHH:mm:ss')
+    $daily.StartBoundary = [DateTime]::Today.AddHours(6).ToString('yyyy-MM-ddTHH:mm:ss')
     $triggers = @((New-ScheduledTaskTrigger -AtLogOn -User $Configuration.WindowsUserSid), $daily)
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -WakeToRun `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -WakeToRun:$false `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     return New-ScheduledTask -Action $action -Principal $principal -Trigger $triggers -Settings $settings `
         -Description 'KoboSync WSL reading/audio service'

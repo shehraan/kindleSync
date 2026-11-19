@@ -51,10 +51,11 @@ if (-not $taskOwner.StartsWith('S-1-')) {
 Assert-True ($taskOwner -eq $configuration.WindowsUserSid) 'Task must use the original Windows user'
 Assert-True ($task.Settings.ExecutionTimeLimit -eq 'PT0S') 'Long-running service must have no execution time limit'
 Assert-True ([int]$task.Settings.MultipleInstances -eq 2) 'Overlapping starts must be ignored'
-Assert-True ($task.Settings.WakeToRun -and $task.Settings.StartWhenAvailable) 'Wake and restart catch-up must be requested'
+Assert-True (-not $task.Settings.WakeToRun) 'KoboSync must not wake the PC'
+Assert-True $task.Settings.StartWhenAvailable 'Missed daily runs must catch up when the PC is available'
 Assert-True (-not $task.Settings.DisallowStartIfOnBatteries -and -not $task.Settings.StopIfGoingOnBatteries) 'Task must not silently stop on battery'
 Assert-True (@($task.Triggers).Count -eq 2) 'Task needs logon and daily recovery triggers'
-Assert-True (@($task.Triggers | Where-Object { $_.StartBoundary -match '^\d{4}-\d{2}-\d{2}T05:50:00$' }).Count -eq 1) 'Daily recovery must stay at 05:50 local across DST changes'
+Assert-True (@($task.Triggers | Where-Object { $_.StartBoundary -match '^\d{4}-\d{2}-\d{2}T06:00:00$' }).Count -eq 1) 'Daily recovery must stay at 06:00 local across DST changes'
 
 $owned = [pscustomobject]@{ Description = 'KoboSync WSL reading/audio service'; Actions = $task.Actions; Principal = $task.Principal }
 Assert-KoboSyncTaskCompatible $owned $configuration
