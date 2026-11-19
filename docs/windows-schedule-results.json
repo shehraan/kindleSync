@@ -1,0 +1,14 @@
+{
+  "CheckedAt": "2026-11-19T16:16:06.4629362Z",
+  "DailyLocalTime": "06:00",
+  "WindowsTimeZone": "US Eastern Standard Time",
+  "CoordinatorZone": "America/Toronto",
+  "WakeToRun": false,
+  "StartWhenAvailable": true,
+  "LogonRecovery": true,
+  "State": "Running",
+  "NextRunTime": "2026-11-20T06:00:00.0000000-05:00",
+  "ActionAndPrincipalPreserved": true,
+  "ServiceRestarted": false,
+  "ServiceHealthy": true
+}

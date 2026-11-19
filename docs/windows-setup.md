@@ -2,9 +2,11 @@
 
 The Windows `KoboSync` task starts WSL Ubuntu-24.04 and the project launcher
 `deploy/run-server.sh` under the original user's limited, interactive token.
-It starts at logon and daily at 05:50 local time, requests wake, has no run time
-limit, and ignores overlapping launches. No Windows password is stored. The
-coordinator processes reading at **06:00 America/Toronto**.
+It starts at logon and daily at **06:00 local time**, with **WakeToRun disabled**
+and missed-run catch-up enabled. It has no run time limit and ignores overlapping
+launches. No Windows password is stored. The coordinator processes reading at
+**06:00 America/Toronto**; its durable schedule catches up when the service
+becomes available after that time and avoids repeating a completed handoff.
 
 The October 21 coordinator also runs a separate automatic EPUB preparation worker.
 New English EPUBs uploaded by the updated Kobo plugin are narrated locally with
@@ -23,13 +25,13 @@ store. [Verification metadata](windows-runtime-results.json) records this check.
 A complete authenticated 5,157,705-byte audiobook transfer through the
 Wi-Fi address passed SHA-256 verification from WSL. Both physical devices subsequently reached the service over home Wi-Fi.
 
-Keep Windows signed in, connected to home Wi-Fi and available overnight; a
-locked session is fine. Startup requests wake but does not override the PC's
-sleep/wake power policy. Current idle sleep is two hours on AC and fifteen
-minutes on battery; wake timers are enabled. Keep the PC awake for the first
-overnight test so it can receive reading progress before the Kobo sleeps.
-This setup does not promise an exact Android download
-time: Android schedules the app's unmetered background job.
+Keep Windows signed in and connected to home Wi-Fi; a locked session is fine.
+KoboSync does not request that the PC wake. If the PC sleeps through 06:00, the
+handoff runs later after it wakes and the service is available. The background
+service also starts at sign-in so browsing and syncing remain available; the
+morning handoff still waits until 06:00. Android controls the timing of its
+unmetered background download job. [Installed schedule verification](windows-schedule-results.json)
+records the no-wake and catch-up settings.
 
 On October 20, the PC server address was `http://10.0.0.49:8787`. It changed
 from `10.0.0.213`; the router also returned that stale address for the host name.
